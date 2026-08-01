@@ -23,14 +23,13 @@ jobs:
         with:
           node-version: 22
 
-      - name: Install Wrangler CLI
+      - name: Install Wrangler
         run: npm install -g wrangler
 
-      - name: Process, Deploy and Collect Domains
-        shell: bash
+      - name: Batch Deploy Operations
         env:
           CF_ACCOUNTS: ${{ secrets.CF_ACCOUNTS }}
-          ADMIN_PASS: ${{ secrets.ADMIN }}
+          ADMIN_PASS: ${{ secrets.ADMIN_PASS }}
         run: |
           if [ -z "$CF_ACCOUNTS" ]; then
             echo "❌ [ERROR] 未检测到 CF_ACCOUNTS 变量！请在 GitHub Secrets 中配置。"
@@ -50,7 +49,7 @@ jobs:
 
           # 逐行读取多账号配置 (Format: ACCOUNT_ID:API_TOKEN)
           while IFS= read -r line || [ -n "$line" ]; do
-            # 过滤空行与以 # 开头的注释行
+            # 过滤空行与注释
             line=$(echo "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
             if [[ -z "$line" || "$line" =~ ^# ]]; then
               continue
@@ -64,9 +63,12 @@ jobs:
             echo "🚀 处理第 ${INDEX} 个账号 [ID: ${ACCOUNT_ID}] -> 项目名: ${PROJECT_NAME}"
             echo "=================================================="
 
-            # 1. 检查或自动创建名称为 kv 的命名空间 (去特征化)
+            # 显式导出当前账号的环境变量，防止 Wrangler 内部缓存跨账号混淆
+            export CLOUDFLARE_ACCOUNT_ID="${ACCOUNT_ID}"
+            export CLOUDFLARE_API_TOKEN="${API_TOKEN}"
+
+            # 1. 检查或自动创建名称为 kv 的命名空间
             KV_NAME="kv"
-            
             KV_LIST_RESP=$(curl -s -X GET "https://api.cloudflare.com/client/v4/accounts/${ACCOUNT_ID}/storage/kv/namespaces" \
               -H "Authorization: Bearer ${API_TOKEN}" \
               -H "Content-Type: application/json")
@@ -93,41 +95,38 @@ jobs:
             fi
 
             # 2. 动态构建 Wrangler 部署配置文件
-            {
-              echo "name = \"${PROJECT_NAME}\""
-              echo 'pages_build_output_dir = "."'
-              echo ''
-              echo '[vars]'
-              echo "ADMIN = \"${ADMIN_PASS}\""
-              echo 'URL = "https://cloudflare-error-page-3th.pages.dev"'
-              echo 'PRELOAD_RACE_DIAL = "1"'
-              echo 'TCP_CONCURRENT_DIAL = "4"'
-              echo 'PROXY_CONCURRENT_DIAL = "4"'
-              echo ''
-              echo '[[kv_namespaces]]'
-              echo 'binding = "KV"'
-              echo "id = \"${KV_ID}\""
-            } > wrangler.toml
+            cat <<EOF > wrangler.toml
+          name = "${PROJECT_NAME}"
+          pages_build_output_dir = "."
 
-            # 3.1 尝试创建 Pages 项目（若不存在自动创建，若已存在忽略报错）
+          [vars]
+          ADMIN = "${ADMIN_PASS}"
+          URL = "https://cloudflare-error-page-3th.pages.dev"
+          PRELOAD_RACE_DIAL = "1"
+          TCP_CONCURRENT_DIAL = "4"
+          PROXY_CONCURRENT_DIAL = "4"
+
+          [[kv_namespaces]]
+          binding = "KV"
+          id = "${KV_ID}"
+          EOF
+
+            # 3.1 尝试创建 Pages 项目
             echo "📦 检查并自动创建 Pages 项目 (${PROJECT_NAME})..."
-            CLOUDFLARE_ACCOUNT_ID="${ACCOUNT_ID}" CLOUDFLARE_API_TOKEN="${API_TOKEN}" \
             wrangler pages project create "${PROJECT_NAME}" --production-branch="main" || true
 
             # 3.2 执行 Cloudflare Pages 部署
             echo "🌐 正在推送代码并部署至 Cloudflare Pages (项目名: ${PROJECT_NAME})..."
-            CLOUDFLARE_ACCOUNT_ID="${ACCOUNT_ID}" CLOUDFLARE_API_TOKEN="${API_TOKEN}" \
             wrangler pages deploy . --project-name="${PROJECT_NAME}" --branch=main --commit-dirty=true
 
-            # 4. 获取分配的真实域名，剔除重复后缀后拼接 /admin 追加写入临时文件
+            # 4. 获取分配的真实域名
             PROJECT_RESP=$(curl -s -X GET "https://api.cloudflare.com/client/v4/accounts/${ACCOUNT_ID}/pages/projects/${PROJECT_NAME}" \
               -H "Authorization: Bearer ${API_TOKEN}" \
               -H "Content-Type: application/json")
-            
+
             SUBDOMAIN=$(echo "$PROJECT_RESP" | jq -r ".result.subdomain")
 
             if [ -n "$SUBDOMAIN" ] && [ "$SUBDOMAIN" != "null" ]; then
-              # 剥离可能自带的 .pages.dev 后缀以保证兼容性
               CLEAN_SUBDOMAIN="${SUBDOMAIN%.pages.dev}"
               FULL_ADMIN_URL="https://${CLEAN_SUBDOMAIN}.pages.dev/admin"
               echo "🔗 成功获取面板地址: ${FULL_ADMIN_URL}"
@@ -137,25 +136,19 @@ jobs:
             fi
 
             echo "🎉 第 ${INDEX} 个账号部署完成！"
-            
-            # 序号自增
             INDEX=$((INDEX + 1))
           done <<< "$CF_ACCOUNTS"
 
-      - name: Update domain.txt conditionally
-        shell: bash
+      - name: Update Domain List & Push to Repo
         run: |
-          # 格式化并合并到正式的 domain.txt 文件中
           if [ -f domain_temp.txt ]; then
             sort -u domain_temp.txt -o domain.txt
             rm domain_temp.txt
           fi
 
-          # 配置 Git 提交身份
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
 
-          # 检查文件是否发生变化
           if git status --porcelain | grep -q "domain.txt"; then
             echo "📝 检测到 domain.txt 内容更新，准备提交更改..."
             git add domain.txt
