@@ -1,0 +1,157 @@
+name: 批量自动部署至 Cloudflare Pages
+
+on:
+  push:
+    branches:
+      - main  # 配合 sync.yml，上游同步更新 main 分支后自动触发
+  workflow_dispatch: # 支持在 GitHub 界面手动一键运行
+
+permissions:
+  contents: write  # 允许脚本更新 domain.txt 并提交回 GitHub 仓库
+
+jobs:
+  batch-deploy:
+    name: Batch Deploy & Update Domain List
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Process, Deploy and Collect Domains
+        shell: bash
+        env:
+          CF_ACCOUNTS: ${{ secrets.CF_ACCOUNTS }}
+          ADMIN_PASS: ${{ secrets.ADMIN }}
+        run: |
+          if [ -z "$CF_ACCOUNTS" ]; then
+            echo "❌ [ERROR] 未检测到 CF_ACCOUNTS 变量！请在 GitHub Secrets 中配置。"
+            exit 1
+          fi
+
+          if [ -z "$ADMIN_PASS" ]; then
+            echo "❌ [ERROR] 未检测到 ADMIN 变量！请在 GitHub Secrets 中配置管理员密码。"
+            exit 1
+          fi
+
+          # 清空临时域名记录文件
+          > domain_temp.txt
+
+          # 初始化账号序号（第一个账号命名为 1，第二个为 2，依次类推）
+          INDEX=1
+
+          # 逐行读取多账号配置 (Format: ACCOUNT_ID:API_TOKEN)
+          echo "$CF_ACCOUNTS" | while IFS= read -r line || [ -n "$line" ]; do
+            # 过滤空行与以 # 开头的注释行
+            line=$(echo "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+            if [[ -z "$line" || "$line" =~ ^# ]]; then
+              continue
+            fi
+
+            ACCOUNT_ID=$(echo "$line" | cut -d':' -f1 | tr -d ' ')
+            API_TOKEN=$(echo "$line" | cut -d':' -f2 | tr -d ' ')
+            PROJECT_NAME="${INDEX}"
+
+            echo "=================================================="
+            echo "🚀 处理第 ${INDEX} 个账号 [ID: ${ACCOUNT_ID}] -> 项目名: ${PROJECT_NAME}"
+            echo "=================================================="
+
+            # 1. 检查或自动创建名称为 kv 的命名空间 (去特征化)
+            KV_NAME="kv"
+            
+            KV_LIST_RESP=$(curl -s -X GET "https://api.cloudflare.com/client/v4/accounts/${ACCOUNT_ID}/storage/kv/namespaces" \
+              -H "Authorization: Bearer ${API_TOKEN}" \
+              -H "Content-Type: application/json")
+
+            KV_ID=$(echo "$KV_LIST_RESP" | jq -r ".result[]? | select(.title==\"${KV_NAME}\") | .id")
+
+            if [ -z "$KV_ID" ] || [ "$KV_ID" == "null" ]; then
+              echo "📦 未检测到名称为 '${KV_NAME}' 的 KV 空间，正在自动创建..."
+              CREATE_KV_RESP=$(curl -s -X POST "https://api.cloudflare.com/client/v4/accounts/${ACCOUNT_ID}/storage/kv/namespaces" \
+                -H "Authorization: Bearer ${API_TOKEN}" \
+                -H "Content-Type: application/json" \
+                --data "{\"title\":\"${KV_NAME}\"}")
+              
+              KV_ID=$(echo "$CREATE_KV_RESP" | jq -r ".result.id")
+              if [ -z "$KV_ID" ] || [ "$KV_ID" == "null" ]; then
+                echo "❌ 创建 KV 空间失败，详细响应: ${CREATE_KV_RESP}"
+                echo "⚠️ 跳过当前账号，准备处理下一个..."
+                INDEX=$((INDEX + 1))
+                continue
+              fi
+              echo "✅ KV 空间创建成功，ID: ${KV_ID}"
+            else
+              echo "✅ 检测到已存在 KV 空间，ID: ${KV_ID}"
+            fi
+
+            # 2. 动态构建 Wrangler 部署配置文件 (保持严格缩进以满足 YAML 要求)
+            cat <<EOF | sed 's/^[[:space:]]*//' > wrangler.toml
+            name = "${PROJECT_NAME}"
+            pages_build_output_dir = "."
+
+            [vars]
+            ADMIN = "${ADMIN_PASS}"
+            URL = "https://cloudflare-error-page-3th.pages.dev"
+            PRELOAD_RACE_DIAL = "1"
+            TCP_CONCURRENT_DIAL = "4"
+            PROXY_CONCURRENT_DIAL = "4"
+
+            [[kv_namespaces]]
+            binding = "KV"
+            id = "${KV_ID}"
+EOF
+
+            # 3. 执行 Cloudflare Pages 部署 (项目名为序号 1, 2, 3...)
+            echo "🌐 正在推送代码并部署至 Cloudflare Pages (项目名: ${PROJECT_NAME})..."
+            CLOUDFLARE_ACCOUNT_ID="${ACCOUNT_ID}" CLOUDFLARE_API_TOKEN="${API_TOKEN}" \
+            npx wrangler pages deploy . --project-name="${PROJECT_NAME}" --branch=main --commit-dirty=true
+
+            # 4. 获取分配的真实 .pages.dev 域名并拼接 /admin 追加写入临时文件
+            PROJECT_RESP=$(curl -s -X GET "https://api.cloudflare.com/client/v4/accounts/${ACCOUNT_ID}/pages/projects/${PROJECT_NAME}" \
+              -H "Authorization: Bearer ${API_TOKEN}" \
+              -H "Content-Type: application/json")
+            
+            SUBDOMAIN=$(echo "$PROJECT_RESP" | jq -r ".result.subdomain")
+
+            if [ -n "$SUBDOMAIN" ] && [ "$SUBDOMAIN" != "null" ]; then
+              FULL_ADMIN_URL="https://${SUBDOMAIN}.pages.dev/admin"
+              echo "🔗 成功获取面板地址: ${FULL_ADMIN_URL}"
+              echo "${FULL_ADMIN_URL}" >> domain_temp.txt
+            else
+              echo "⚠️ 无法获取当前账号 Pages 的域名信息。"
+            fi
+
+            echo "🎉 第 ${INDEX} 个账号部署完成！"
+            
+            # 序号自增
+            INDEX=$((INDEX + 1))
+          done
+
+      - name: Update domain.txt conditionally
+        shell: bash
+        run: |
+          # 格式化并合并到正式的 domain.txt 文件中
+          if [ -f domain_temp.txt ]; then
+            sort -u domain_temp.txt -o domain.txt
+            rm domain_temp.txt
+          fi
+
+          # 配置 Git 提交身份
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+          # 检查文件是否发生变化
+          if git status --porcelain | grep -q "domain.txt"; then
+            echo "📝 检测到 domain.txt 内容更新，准备提交更改..."
+            git add domain.txt
+            git commit -m "chore: auto update deployed domains list [skip ci]"
+            git push
+            echo "✅ domain.txt 已成功推送至仓库！"
+          else
+            echo "✨ domain.txt 内容无变化，跳过 Commit 提交以保持历史记录干净。"
+          fi
