@@ -89,22 +89,22 @@ jobs:
               echo "✅ 检测到已存在 KV 空间，ID: ${KV_ID}"
             fi
 
-            # 2. 动态构建 Wrangler 部署配置文件 (保持严格缩进以满足 YAML 要求)
-            cat <<EOF | sed 's/^[[:space:]]*//' > wrangler.toml
-            name = "${PROJECT_NAME}"
-            pages_build_output_dir = "."
-
-            [vars]
-            ADMIN = "${ADMIN_PASS}"
-            URL = "https://cloudflare-error-page-3th.pages.dev"
-            PRELOAD_RACE_DIAL = "1"
-            TCP_CONCURRENT_DIAL = "4"
-            PROXY_CONCURRENT_DIAL = "4"
-
-            [[kv_namespaces]]
-            binding = "KV"
-            id = "${KV_ID}"
-EOF
+            # 2. 动态构建 Wrangler 部署配置文件 (全行保持统一缩进)
+            {
+              echo "name = \"${PROJECT_NAME}\""
+              echo 'pages_build_output_dir = "."'
+              echo ''
+              echo '[vars]'
+              echo "ADMIN = \"${ADMIN_PASS}\""
+              echo 'URL = "https://cloudflare-error-page-3th.pages.dev"'
+              echo 'PRELOAD_RACE_DIAL = "1"'
+              echo 'TCP_CONCURRENT_DIAL = "4"'
+              echo 'PROXY_CONCURRENT_DIAL = "4"'
+              echo ''
+              echo '[[kv_namespaces]]'
+              echo 'binding = "KV"'
+              echo "id = \"${KV_ID}\""
+            } > wrangler.toml
 
             # 3. 执行 Cloudflare Pages 部署 (项目名为序号 1, 2, 3...)
             echo "🌐 正在推送代码并部署至 Cloudflare Pages (项目名: ${PROJECT_NAME})..."
