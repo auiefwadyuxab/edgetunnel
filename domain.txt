@@ -1,6 +1,6 @@
-https://1-3da.pages.dev.pages.dev/admin
-https://2-9lg.pages.dev.pages.dev/admin
-https://3-42i.pages.dev.pages.dev/admin
-https://4-3l4.pages.dev.pages.dev/admin
-https://5-534.pages.dev.pages.dev/admin
-https://6-c5y.pages.dev.pages.dev/admin
+https://1-3da.pages.dev/admin
+https://2-9lg.pages.dev/admin
+https://3-42i.pages.dev/admin
+https://4-3l4.pages.dev/admin
+https://5-534.pages.dev/admin
+https://6-c5y.pages.dev/admin
