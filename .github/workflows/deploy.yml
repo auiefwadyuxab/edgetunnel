@@ -21,7 +21,10 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
+
+      - name: Install Wrangler CLI
+        run: npm install -g wrangler
 
       - name: Process, Deploy and Collect Domains
         shell: bash
@@ -42,11 +45,11 @@ jobs:
           # 清空临时域名记录文件
           > domain_temp.txt
 
-          # 初始化账号序号（第一个账号命名为 1，第二个为 2，依次类推）
+          # 初始化账号序号
           INDEX=1
 
           # 逐行读取多账号配置 (Format: ACCOUNT_ID:API_TOKEN)
-          echo "$CF_ACCOUNTS" | while IFS= read -r line || [ -n "$line" ]; do
+          while IFS= read -r line || [ -n "$line" ]; do
             # 过滤空行与以 # 开头的注释行
             line=$(echo "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
             if [[ -z "$line" || "$line" =~ ^# ]]; then
@@ -89,7 +92,7 @@ jobs:
               echo "✅ 检测到已存在 KV 空间，ID: ${KV_ID}"
             fi
 
-            # 2. 动态构建 Wrangler 部署配置文件 (全行保持统一缩进)
+            # 2. 动态构建 Wrangler 部署配置文件
             {
               echo "name = \"${PROJECT_NAME}\""
               echo 'pages_build_output_dir = "."'
@@ -109,14 +112,14 @@ jobs:
             # 3.1 尝试创建 Pages 项目（若不存在自动创建，若已存在忽略报错）
             echo "📦 检查并自动创建 Pages 项目 (${PROJECT_NAME})..."
             CLOUDFLARE_ACCOUNT_ID="${ACCOUNT_ID}" CLOUDFLARE_API_TOKEN="${API_TOKEN}" \
-            npx wrangler pages project create "${PROJECT_NAME}" --production-branch="main" || true
+            wrangler pages project create "${PROJECT_NAME}" --production-branch="main" || true
 
             # 3.2 执行 Cloudflare Pages 部署
             echo "🌐 正在推送代码并部署至 Cloudflare Pages (项目名: ${PROJECT_NAME})..."
             CLOUDFLARE_ACCOUNT_ID="${ACCOUNT_ID}" CLOUDFLARE_API_TOKEN="${API_TOKEN}" \
-            npx wrangler pages deploy . --project-name="${PROJECT_NAME}" --branch=main --commit-dirty=true
+            wrangler pages deploy . --project-name="${PROJECT_NAME}" --branch=main --commit-dirty=true
 
-            # 4. 获取分配的真实 .pages.dev 域名并拼接 /admin 追加写入临时文件
+            # 4. 获取分配的真实域名，剔除重复后缀后拼接 /admin 追加写入临时文件
             PROJECT_RESP=$(curl -s -X GET "https://api.cloudflare.com/client/v4/accounts/${ACCOUNT_ID}/pages/projects/${PROJECT_NAME}" \
               -H "Authorization: Bearer ${API_TOKEN}" \
               -H "Content-Type: application/json")
@@ -124,7 +127,9 @@ jobs:
             SUBDOMAIN=$(echo "$PROJECT_RESP" | jq -r ".result.subdomain")
 
             if [ -n "$SUBDOMAIN" ] && [ "$SUBDOMAIN" != "null" ]; then
-              FULL_ADMIN_URL="https://${SUBDOMAIN}.pages.dev/admin"
+              # 剥离可能自带的 .pages.dev 后缀以保证兼容性
+              CLEAN_SUBDOMAIN="${SUBDOMAIN%.pages.dev}"
+              FULL_ADMIN_URL="https://${CLEAN_SUBDOMAIN}.pages.dev/admin"
               echo "🔗 成功获取面板地址: ${FULL_ADMIN_URL}"
               echo "${FULL_ADMIN_URL}" >> domain_temp.txt
             else
@@ -135,7 +140,7 @@ jobs:
             
             # 序号自增
             INDEX=$((INDEX + 1))
-          done
+          done <<< "$CF_ACCOUNTS"
 
       - name: Update domain.txt conditionally
         shell: bash
