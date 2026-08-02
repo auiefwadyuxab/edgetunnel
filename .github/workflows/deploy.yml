@@ -67,7 +67,7 @@ jobs:
             echo "🚀 正在处理第 ${INDEX} 个账号 [ID: ${ACCOUNT_ID}] -> 项目名: ${PROJECT_NAME}"
             echo "=================================================="
 
-            # 1. 查询或创建名称为 kv 的命名空间
+            # 1. 查询或创建名称为 kv 的命名空间 (去特征化)
             KV_NAME="kv"
             
             KV_LIST_RESP=$(curl -s -X GET "https://api.cloudflare.com/client/v4/accounts/${ACCOUNT_ID}/storage/kv/namespaces" \
@@ -95,13 +95,11 @@ jobs:
               echo "✅ 检测到已存在 KV 空间，ID: ${KV_ID}"
             fi
 
-            # 2. 优雅生成干净的 wrangler.toml 配置文件
+            # 2. 动态生成干净的 wrangler.toml 配置文件
             cat <<EOF > wrangler.toml
 name = "${PROJECT_NAME}"
-main = "_worker.js"
 compatibility_date = "2025-11-04"
 pages_build_output_dir = "."
-keep_vars = true
 
 [vars]
 ADMIN = "${ADMIN_PASS}"
@@ -146,7 +144,7 @@ EOF
             INDEX=$((INDEX + 1))
           done <<< "$CF_ACCOUNTS"
 
-          # 清理本地生成的 wrangler.toml，还原工作区
+          # 清理本地生成的 wrangler.toml，还原工作区状态
           git checkout wrangler.toml 2>/dev/null || rm -f wrangler.toml
 
       - name: Update domain.txt conditionally
