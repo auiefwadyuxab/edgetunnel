@@ -102,13 +102,11 @@ jobs:
               echo "✅ 检测到已存在 KV 空间，ID: ${KV_ID}"
             fi
 
-            # 2. 动态生成干净的 wrangler.toml 配置文件
+            # 2. 动态生成干净且符合 Pages 规范的 wrangler.toml
             {
               echo "name = \"${PROJECT_NAME}\""
-              echo "main = \"_worker.js\""
               echo "compatibility_date = \"2025-11-04\""
               echo "pages_build_output_dir = \".\""
-              echo "keep_vars = true"
               echo ""
               echo "[vars]"
               echo "ADMIN = \"${ADMIN_PASS}\""
