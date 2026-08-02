@@ -1,25 +1,31 @@
 > [!NOTE]
-> 🤖 **全新支持 GitHub Actions 一键多账号自动化批量部署！**
-> 本仓库已集成全自动部署工作流，无需配置本地环境，支持单仓库自动部署至多个 Cloudflare 账号，自动绑定 KV 并生成专属面板链接[span_1](start_span)[span_1](end_span)。
-> 
-> <details>
-> <summary><code><strong>👉 点击展开：自动化部署优势与 3 步快捷配置指南</strong></code></summary>
-> 
-> ### ⚡ 自动化脚本核心优势
-> - 🔄 **多账号矩阵部署**：支持同时轮询部署至多个 Cloudflare 账号，实现节点快速复刻[span_2](start_span)[span_2](end_span)。
-> - 📦 **零配置 KV 自动绑定**：智能识别或自动创建 Cloudflare KV 命名空间并完成绑定，无需手动点击[span_3](start_span)[span_3](end_span)。
-> - 🛡️ **智能参数注入**：自动注入后台密码及网络优化参数，环境彻底隔离无交叉污染[span_4](start_span)[span_4](end_span)。
-> - 🌐 **域名自动汇总导出**：自动抓取并清洗 Cloudflare Pages 分配的专属域名，部署成功后自动生成并保存面板链接至 `domain.txt`[span_5](start_span)[span_5](end_span)。
-> 
-> ### 🛠️ 快捷配置步骤
-> 1. **Fork 本仓库** 后，进入仓库的 **Settings** -> **Secrets and variables** -> **Actions**[span_6](start_span)[span_6](end_span)[span_7](start_span)[span_7](end_span)。
-> 2. 新增以下两个 **Repository Secrets**[span_8](start_span)[span_8](end_span)：
->    - `CF_ACCOUNTS`：Cloudflare 账号凭证，格式为 `ACCOUNT_ID:API_TOKEN`（支持多账号，每行一个）[span_9](start_span)[span_9](end_span)。
->    - `ADMIN`：你的后台管理面板登录密码[span_10](start_span)[span_10](end_span)[span_11](start_span)[span_11](end_span)。
-> 3. 进入 **Actions** 页面手动触发 **Batch Deploy & Update Domain List** 工作流，或推送代码即可自动完成全套部署[span_12](start_span)[span_12](end_span)！
-> 
-> </details>
+> **🤖 支持 GitHub Actions 自动化批量部署到 Cloudflare Pages**
+> 本仓库已集成自动化工作流，支持单/多账号轮询部署、自动创建并绑定 KV 空间，部署完成后会自动导出面板链接至 `domain.txt`。
+### 🔑 1. 配置 GitHub Actions Secrets（必选）
+Fork 本仓库后，在仓库的 **Settings -> Secrets and variables -> Actions** 中点击 **New repository secret** 添加以下变量：
 
+| Secret 变量名 | 是否必填 | 格式 / 说明 |
+| :--- | :--- | :--- |
+| **`CF_ACCOUNTS`** | **必填** | Cloudflare 账号凭证，支持多账号（每行一个）。<br>格式：`ACCOUNT_ID:API_TOKEN` |
+| **`ADMIN`** | **必填** | 后台管理面板登录密码 |
+
+---
+### ⚙️ 2. 部署脚本参数配置（可选调整）
+脚本（文件位置：`.github/workflows/deploy.yml`）在部署时会自动注入以下默认参数。如需更改，直接修改 `deploy.yml` 中对应的数值即可：
+
+| 参数名称 | 脚本默认值 | 修改说明 |
+| :--- | :--- | :--- |
+| **`URL`** | `https://cloudflare-error-page-3th.pages.dev` | 默认主页伪装网页地址 |
+| **`PRELOAD_RACE_DIAL`** | `1` | 是否开启预加载竞速拨号（`1` 为开启，`0` 为关闭） |
+| **`TCP_CONCURRENT_DIAL`** | `4` | TCP 并发拨号数 |
+| **`PROXY_CONCURRENT_DIAL`** | `4` | 反代并发拨号数 |
+| **`KV 空间名称`** | `kv` | 脚本会自动在 CF 账号中查找或新建名为 `kv` 的命名空间并自动绑定 |
+
+---
+### 🚀 3. 快速触发部署
+1. **Fork 本仓库** 并完成上述 **Secrets** 配置。
+2. 进入仓库的 **Actions** 标签页，选择 **Batch Deploy & Update Domain List** 手动运行；或后续提交代码（`push`）时自动触发。
+3. 部署完成后，脚本会自动将所有生成的面板地址更新并保存到仓库根目录的 `domain.txt` 文件中。
 ---
 # 🚀 edgetunnel 2.1
 ![后台页面](./img.png)
