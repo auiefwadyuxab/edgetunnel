@@ -23,14 +23,6 @@ jobs:
         with:
           node-version: 22
 
-      - name: Cache Wrangler CLI
-        uses: actions/cache@v4
-        with:
-          path: ~/.npm
-          key: ${{ runner.os }}-wrangler-${{ hashFiles('**/package-lock.json') }}
-          restore-keys: |
-            ${{ runner.os }}-wrangler-
-
       - name: Install Wrangler CLI
         run: npm install -g wrangler@latest
 
@@ -58,23 +50,24 @@ jobs:
 
           # 逐行读取多账号配置 (格式: ACCOUNT_ID:API_TOKEN)
           while IFS= read -r line || [ -n "$line" ]; do
-            # 清理前后空白字符
-            line=$(echo "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+            # 去除首尾空白
+            line=$(echo "$line" | xargs)
             
             # 过滤空行与注释行
             if [[ -z "$line" || "$line" =~ ^# ]]; then
               continue
             fi
 
-            ACCOUNT_ID=$(echo "$line" | cut -d':' -f1 | tr -d ' ')
-            API_TOKEN=$(echo "$line" | cut -d':' -f2 | tr -d ' ')
+            # 使用 Bash 原生截取，规避频繁创建子进程
+            ACCOUNT_ID=$(echo "${line%%:*}" | xargs)
+            API_TOKEN=$(echo "${line#*:}" | xargs)
             PROJECT_NAME="${INDEX}"
 
             echo "=================================================="
             echo "🚀 正在处理第 ${INDEX} 个账号 [ID: ${ACCOUNT_ID}] -> 项目名: ${PROJECT_NAME}"
             echo "=================================================="
 
-            # 1. 查询或创建名称为 kv 的命名空间 (去特征化)
+            # 1. 查询或创建名称为 kv 的命名空间
             KV_NAME="kv"
             
             KV_LIST_RESP=$(curl -s -X GET "https://api.cloudflare.com/client/v4/accounts/${ACCOUNT_ID}/storage/kv/namespaces" \
@@ -102,37 +95,37 @@ jobs:
               echo "✅ 检测到已存在 KV 空间，ID: ${KV_ID}"
             fi
 
-            # 2. 动态生成干净且符合 Pages 规范的 wrangler.toml
-            {
-              echo "name = \"${PROJECT_NAME}\""
-              echo "compatibility_date = \"2025-11-04\""
-              echo "pages_build_output_dir = \".\""
-              echo ""
-              echo "[vars]"
-              echo "ADMIN = \"${ADMIN_PASS}\""
-              echo "URL = \"https://cloudflare-error-page-3th.pages.dev\""
-              echo "PRELOAD_RACE_DIAL = \"1\""
-              echo "TCP_CONCURRENT_DIAL = \"4\""
-              echo "PROXY_CONCURRENT_DIAL = \"4\""
-              echo ""
-              echo "[[kv_namespaces]]"
-              echo "binding = \"KV\""
-              echo "id = \"${KV_ID}\""
-            } > wrangler.toml
+            # 2. 优雅生成干净的 wrangler.toml 配置文件
+            cat <<EOF > wrangler.toml
+name = "${PROJECT_NAME}"
+main = "_worker.js"
+compatibility_date = "2025-11-04"
+pages_build_output_dir = "."
+keep_vars = true
 
-            # 3. 在独立子 Shell ( ... ) 中运行 Wrangler，隔离环境变量避免账号污染
+[vars]
+ADMIN = "${ADMIN_PASS}"
+URL = "https://cloudflare-error-page-3th.pages.dev"
+PRELOAD_RACE_DIAL = "1"
+TCP_CONCURRENT_DIAL = "4"
+PROXY_CONCURRENT_DIAL = "4"
+
+[[kv_namespaces]]
+binding = "KV"
+id = "${KV_ID}"
+EOF
+
+            # 3. 隔离环境部署（清除 Wrangler 全局缓存防止账号信息遗留污染）
             (
+              rm -rf ~/.config/.wrangler
               export CLOUDFLARE_ACCOUNT_ID="${ACCOUNT_ID}"
               export CLOUDFLARE_API_TOKEN="${API_TOKEN}"
-
-              echo "📦 检查并创建 Pages 项目 (${PROJECT_NAME})..."
-              wrangler pages project create "${PROJECT_NAME}" --production-branch="main" || true
 
               echo "🌐 正在推送代码部署至 Cloudflare Pages (项目名: ${PROJECT_NAME})..."
               wrangler pages deploy . --project-name="${PROJECT_NAME}" --branch=main --commit-dirty=true
             )
 
-            # 4. 获取分配的域名并清洗后缀，格式化追加至临时记录
+            # 4. 获取分配的域名并清洗后缀
             PROJECT_RESP=$(curl -s -X GET "https://api.cloudflare.com/client/v4/accounts/${ACCOUNT_ID}/pages/projects/${PROJECT_NAME}" \
               -H "Authorization: Bearer ${API_TOKEN}" \
               -H "Content-Type: application/json")
@@ -140,11 +133,9 @@ jobs:
             SUBDOMAIN=$(echo "$PROJECT_RESP" | jq -r ".result.subdomain // empty")
 
             if [ -n "$SUBDOMAIN" ] && [ "$SUBDOMAIN" != "null" ]; then
-              # 剔除可能重复的 .pages.dev 后缀
               CLEAN_SUBDOMAIN="${SUBDOMAIN%.pages.dev}"
               FINAL_URL="https://${CLEAN_SUBDOMAIN}.pages.dev/admin"
             else
-              # API 获取异常时的兜底规则
               FINAL_URL="https://${PROJECT_NAME}.pages.dev/admin"
             fi
 
@@ -155,20 +146,20 @@ jobs:
             INDEX=$((INDEX + 1))
           done <<< "$CF_ACCOUNTS"
 
+          # 清理本地生成的 wrangler.toml，还原工作区
+          git checkout wrangler.toml 2>/dev/null || rm -f wrangler.toml
+
       - name: Update domain.txt conditionally
         shell: bash
         run: |
           if [ -f domain_temp.txt ]; then
-            # 排序去重写入正式 domain.txt
             sort -u domain_temp.txt -o domain.txt
             rm -f domain_temp.txt
           fi
 
-          # 配置 Git 身份
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
 
-          # 检查 domain.txt 是否有变动
           if git diff --name-only | grep -q "^domain.txt$"; then
             echo "📝 检测到 domain.txt 内容有更新，准备提交..."
             git add domain.txt
