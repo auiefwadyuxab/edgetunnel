@@ -50,7 +50,7 @@ jobs:
 
           # 逐行读取多账号配置 (格式: ACCOUNT_ID:API_TOKEN)
           while IFS= read -r line || [ -n "$line" ]; do
-            # 去除首尾空白
+            # 去除首尾空白字符
             line=$(echo "$line" | xargs)
             
             # 过滤空行与注释行
@@ -58,7 +58,7 @@ jobs:
               continue
             fi
 
-            # 使用 Bash 原生截取，规避频繁创建子进程
+            # 使用 Bash 原生字符串截取，规避频繁创建子进程
             ACCOUNT_ID=$(echo "${line%%:*}" | xargs)
             API_TOKEN=$(echo "${line#*:}" | xargs)
             PROJECT_NAME="${INDEX}"
@@ -95,7 +95,7 @@ jobs:
               echo "✅ 检测到已存在 KV 空间，ID: ${KV_ID}"
             fi
 
-            # 2. 动态生成干净的 wrangler.toml 配置文件
+            # 2. 动态生成符合 Pages 规范的 wrangler.toml 配置文件
             cat <<EOF > wrangler.toml
 name = "${PROJECT_NAME}"
 compatibility_date = "2025-11-04"
@@ -113,7 +113,7 @@ binding = "KV"
 id = "${KV_ID}"
 EOF
 
-            # 3. 隔离环境部署（清除 Wrangler 全局缓存防止账号信息遗留污染）
+            # 3. 隔离环境部署（清除全局缓存防止账号遗留污染）
             (
               rm -rf ~/.config/.wrangler
               export CLOUDFLARE_ACCOUNT_ID="${ACCOUNT_ID}"
