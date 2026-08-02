@@ -1,3 +1,26 @@
+> [!NOTE]
+> 🤖 **全新支持 GitHub Actions 一键多账号自动化批量部署！**
+> 本仓库已集成全自动部署工作流，无需配置本地环境，支持单仓库自动部署至多个 Cloudflare 账号，自动绑定 KV 并生成专属面板链接[span_1](start_span)[span_1](end_span)。
+> 
+> <details>
+> <summary><code><strong>👉 点击展开：自动化部署优势与 3 步快捷配置指南</strong></code></summary>
+> 
+> ### ⚡ 自动化脚本核心优势
+> - 🔄 **多账号矩阵部署**：支持同时轮询部署至多个 Cloudflare 账号，实现节点快速复刻[span_2](start_span)[span_2](end_span)。
+> - 📦 **零配置 KV 自动绑定**：智能识别或自动创建 Cloudflare KV 命名空间并完成绑定，无需手动点击[span_3](start_span)[span_3](end_span)。
+> - 🛡️ **智能参数注入**：自动注入后台密码及网络优化参数，环境彻底隔离无交叉污染[span_4](start_span)[span_4](end_span)。
+> - 🌐 **域名自动汇总导出**：自动抓取并清洗 Cloudflare Pages 分配的专属域名，部署成功后自动生成并保存面板链接至 `domain.txt`[span_5](start_span)[span_5](end_span)。
+> 
+> ### 🛠️ 快捷配置步骤
+> 1. **Fork 本仓库** 后，进入仓库的 **Settings** -> **Secrets and variables** -> **Actions**[span_6](start_span)[span_6](end_span)[span_7](start_span)[span_7](end_span)。
+> 2. 新增以下两个 **Repository Secrets**[span_8](start_span)[span_8](end_span)：
+>    - `CF_ACCOUNTS`：Cloudflare 账号凭证，格式为 `ACCOUNT_ID:API_TOKEN`（支持多账号，每行一个）[span_9](start_span)[span_9](end_span)。
+>    - `ADMIN`：你的后台管理面板登录密码[span_10](start_span)[span_10](end_span)[span_11](start_span)[span_11](end_span)。
+> 3. 进入 **Actions** 页面手动触发 **Batch Deploy & Update Domain List** 工作流，或推送代码即可自动完成全套部署[span_12](start_span)[span_12](end_span)！
+> 
+> </details>
+
+---
 # 🚀 edgetunnel 2.1
 ![后台页面](./img.png)
 
