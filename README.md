@@ -1,32 +1,3 @@
-> [!NOTE]
-> **🤖 支持 GitHub Actions 自动化批量部署到 Cloudflare Pages**
-> 本仓库已集成自动化工作流，支持单/多账号轮询部署、自动创建并绑定 KV 空间，部署完成后会自动导出面板链接至 `domain.txt`。
-### 🔑 1. 配置 GitHub Actions Secrets（必选）
-Fork 本仓库后，在仓库的 **Settings -> Secrets and variables -> Actions** 中点击 **New repository secret** 添加以下变量：
-
-| Secret 变量名 | 是否必填 | 格式 / 说明 |
-| :--- | :--- | :--- |
-| **`CF_ACCOUNTS`** | **必填** | Cloudflare 账号凭证，支持多账号（每行一个）。<br>格式：`ACCOUNT_ID:API_TOKEN` |
-| **`ADMIN`** | **必填** | 后台管理面板登录密码 |
-
----
-### ⚙️ 2. 部署脚本参数配置（可选调整）
-脚本（文件位置：`.github/workflows/deploy.yml`）在部署时会自动注入以下默认参数。如需更改，直接修改 `deploy.yml` 中对应的数值即可：
-
-| 参数名称 | 脚本默认值 | 修改说明 |
-| :--- | :--- | :--- |
-| **`URL`** | `https://cloudflare-error-page-3th.pages.dev` | 默认主页伪装网页地址 |
-| **`PRELOAD_RACE_DIAL`** | `1` | 是否开启预加载竞速拨号（`1` 为开启，`0` 为关闭） |
-| **`TCP_CONCURRENT_DIAL`** | `4` | TCP 并发拨号数 |
-| **`PROXY_CONCURRENT_DIAL`** | `4` | 反代并发拨号数 |
-| **`KV 空间名称`** | `kv` | 脚本会自动在 CF 账号中查找或新建名为 `kv` 的命名空间并自动绑定 |
-
----
-### 🚀 3. 快速触发部署
-1. **Fork 本仓库** 并完成上述 **Secrets** 配置。
-2. 进入仓库的 **Actions** 标签页，选择 **Batch Deploy & Update Domain List** 手动运行；或后续提交代码（`push`）时自动触发。
-3. 部署完成后，脚本会自动将所有生成的面板地址更新并保存到仓库根目录的 `domain.txt` 文件中。
----
 # 🚀 edgetunnel 2.1
 ![后台页面](./img.png)
 
