@@ -95,23 +95,23 @@ jobs:
               echo "✅ 检测到已存在 KV 空间，ID: ${KV_ID}"
             fi
 
-            # 2. 动态生成符合 Pages 规范的 wrangler.toml 配置文件
+            # 2. 动态生成符合 Pages 规范的 wrangler.toml 配置文件（修正了此处的缩进）
             cat <<EOF > wrangler.toml
-name = "${PROJECT_NAME}"
-compatibility_date = "2025-11-04"
-pages_build_output_dir = "."
+            name = "${PROJECT_NAME}"
+            compatibility_date = "2025-11-04"
+            pages_build_output_dir = "."
 
-[vars]
-ADMIN = "${ADMIN_PASS}"
-URL = "https://cloudflare-error-page-3th.pages.dev"
-PRELOAD_RACE_DIAL = "1"
-TCP_CONCURRENT_DIAL = "4"
-PROXY_CONCURRENT_DIAL = "4"
+            [vars]
+            ADMIN = "${ADMIN_PASS}"
+            URL = "https://cloudflare-error-page-3th.pages.dev"
+            PRELOAD_RACE_DIAL = "1"
+            TCP_CONCURRENT_DIAL = "4"
+            PROXY_CONCURRENT_DIAL = "4"
 
-[[kv_namespaces]]
-binding = "KV"
-id = "${KV_ID}"
-EOF
+            [[kv_namespaces]]
+            binding = "KV"
+            id = "${KV_ID}"
+            EOF
 
             # 3. 隔离环境部署（清除全局缓存防止账号遗留污染）
             (
