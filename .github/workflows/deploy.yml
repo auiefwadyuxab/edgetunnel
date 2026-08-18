@@ -632,6 +632,7 @@ jobs:
             jq -e \
               --arg admin "${expected_admin}" \
               --arg expect_admin "${expect_admin}" \
+              --arg expect_uuid "${expect_uuid}" \
               --arg uuid "${expect_uuid}" \
               --arg kv_id "${expect_kv}" \
               --arg url "${DEFAULT_URL}" \
