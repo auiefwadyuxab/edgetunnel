@@ -302,7 +302,7 @@ jobs:
           UUID_VALID=false
 
           if [[ -n "${UUID_CONFIG}" ]]; then
-            if [[ "${UUID_CONFIG}" =~ ^([0-9]+):([[:xdigit:]]{8}-[[:xdigit:]]{4}-4[[:xdigit:]]{3}-[89abAB][[:xdigit:]]{3}-[[:xdigit:]]{12})$ ]]; then
+            if [[ "${UUID_CONFIG}" =~ ^([1-9][0-9]*):([[:xdigit:]]{8}-[[:xdigit:]]{4}-4[[:xdigit:]]{3}-[89abAB][[:xdigit:]]{3}-[[:xdigit:]]{12})$ ]]; then
               UUID_SOURCE_INDEX="${BASH_REMATCH[1]}"
               SHARED_UUID="${BASH_REMATCH[2]}"
 
@@ -633,20 +633,34 @@ jobs:
               --arg admin "${expected_admin}" \
               --arg expect_admin "${expect_admin}" \
               --arg expect_uuid "${expect_uuid}" \
-              --arg uuid "${expect_uuid}" \
               --arg kv_id "${expect_kv}" \
               --arg url "${DEFAULT_URL}" \
               --arg preload "${PRELOAD_RACE_DIAL}" \
               --arg tcp "${TCP_CONCURRENT_DIAL}" \
               --arg proxy "${PROXY_CONCURRENT_DIAL}" \
               '.success == true
+               and (.result.deployment_configs.production.env_vars // {} | type) == "object"
                and (.result.deployment_configs.production.env_vars.URL.value // "") == $url
                and (.result.deployment_configs.production.env_vars.PRELOAD_RACE_DIAL.value // "") == $preload
                and (.result.deployment_configs.production.env_vars.TCP_CONCURRENT_DIAL.value // "") == $tcp
                and (.result.deployment_configs.production.env_vars.PROXY_CONCURRENT_DIAL.value // "") == $proxy
                and (.result.deployment_configs.production.kv_namespaces.KV.namespace_id // "") == $kv_id
-               and ($expect_admin != "true" or (.result.deployment_configs.production.env_vars.ADMIN.value // "") == $admin)
-               and ($expect_uuid == "" or (.result.deployment_configs.production.env_vars.UUID.value // "") == $uuid)' \
+               and (
+                 ($expect_admin == "true"
+                   and (.result.deployment_configs.production.env_vars | has("ADMIN"))
+                   and (.result.deployment_configs.production.env_vars.ADMIN.value // "") == $admin)
+                 or
+                 ($expect_admin != "true"
+                   and (.result.deployment_configs.production.env_vars | has("ADMIN") | not))
+               )
+               and (
+                 ($expect_uuid != ""
+                   and (.result.deployment_configs.production.env_vars | has("UUID"))
+                   and (.result.deployment_configs.production.env_vars.UUID.value // "") == $expect_uuid)
+                 or
+                 ($expect_uuid == ""
+                   and (.result.deployment_configs.production.env_vars | has("UUID") | not))
+               )' \
               >/dev/null <<< "${project_json}"
           }
 
@@ -991,12 +1005,7 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
           git fetch origin "${GITHUB_REF_NAME}" --quiet
-
-          if git cat-file -e "origin/${GITHUB_REF_NAME}:domain.txt" 2>/dev/null; then
-            git checkout "origin/${GITHUB_REF_NAME}" -- domain.txt
-          else
-            rm -f domain.txt
-          fi
+          git reset --hard "origin/${GITHUB_REF_NAME}"
 
           # ==========================================================
           # 读取旧 domain.txt
@@ -1089,6 +1098,8 @@ jobs:
               mv "${DOMAIN_NEXT}" domain.txt
               git add domain.txt
               git commit -m "chore: auto update deployed domains list [skip ci]"
+              git fetch origin "${GITHUB_REF_NAME}" --quiet
+              git rebase "origin/${GITHUB_REF_NAME}"
               git push origin "HEAD:${GITHUB_REF_NAME}"
               echo "✅ domain.txt 已推送到 GitHub。"
             fi
