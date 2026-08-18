@@ -63,6 +63,7 @@ jobs:
           CF_ACCOUNTS: ${{ secrets.CF_ACCOUNTS }}
           ADMIN_PASS: ${{ secrets.ADMIN }}
           UUID_CONFIG: ${{ secrets.UUID }}
+          GITHUB_TOKEN: ${{ github.token }}
           WRANGLER_BIN: ${{ runner.temp }}/wrangler/node_modules/.bin/wrangler
         run: |
           set -euo pipefail
@@ -89,6 +90,7 @@ jobs:
           # 运行环境检查
           : "${CF_ACCOUNTS:?❌ 未检测到 CF_ACCOUNTS Secrets 变量}"
           : "${ADMIN_PASS:?❌ 未检测到 ADMIN Secrets 变量}"
+          : "${GITHUB_TOKEN:?❌ 未检测到 GITHUB_TOKEN 变量}"
 
           if [[ ! -x "${WRANGLER_BIN}" ]]; then
             echo "❌ Wrangler 未正确安装：${WRANGLER_BIN}"
@@ -187,6 +189,8 @@ jobs:
               --retry 3 \
               --retry-all-errors \
               -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2026-03-10" \
+              -H "Authorization: Bearer ${GITHUB_TOKEN}" \
               -H "User-Agent: github-actions-edgetunnel-deployer" \
               "https://api.github.com/repos/${UPSTREAM_REPO}/commits/${UPSTREAM_BRANCH}" |
             jq -r '.sha // empty'
@@ -381,6 +385,25 @@ jobs:
 
           api_patch() {
             api_request "$1" PATCH "$2" "$3"
+          }
+
+          verify_env_vars() {
+            local index="$1" admin="$2" url="$3" preload="$4" tcp="$5" proxy="$6"
+            local uuid_required="${7:-false}" uuid_value="${8:-}"
+            local account_id="${ACCOUNT_IDS[$index]}" project_name="$((index + 1))" resp=""
+            resp="$(api_get "${index}" "${API_BASE}/accounts/${account_id}/pages/projects/${project_name}")" || return 1
+            jq -e \
+              --arg admin "${admin}" --arg url "${url}" --arg preload "${preload}" \
+              --arg tcp "${tcp}" --arg proxy "${proxy}" --arg uuid "${uuid_value}" \
+              --argjson uuid_required "${uuid_required}" \
+              '.success == true
+               and (.result.deployment_configs.production.env_vars.ADMIN.value // "") == $admin
+               and (.result.deployment_configs.production.env_vars.URL.value // "") == $url
+               and (.result.deployment_configs.production.env_vars.PRELOAD_RACE_DIAL.value // "") == $preload
+               and (.result.deployment_configs.production.env_vars.TCP_CONCURRENT_DIAL.value // "") == $tcp
+               and (.result.deployment_configs.production.env_vars.PROXY_CONCURRENT_DIAL.value // "") == $proxy
+               and ($uuid_required == false or (.result.deployment_configs.production.env_vars.UUID.value // "") == $uuid)' \
+              >/dev/null <<< "${resp}"
           }
 
           # ==========================================================
@@ -606,7 +629,8 @@ jobs:
             fi
 
             # ----------------------------------------------------------
-            # 3. 配置 Pages 生产环境变量 + KV
+            # 3. 一次性写入 Pages 生产环境变量 + KV
+            #    保持 Cloudflare deployment_configs.production 的原子结构
             # ----------------------------------------------------------
             config_patch="$(
               jq -nc \
@@ -616,71 +640,63 @@ jobs:
                 --arg tcp "${TCP_CONCURRENT_DIAL}" \
                 --arg proxy "${PROXY_CONCURRENT_DIAL}" \
                 --arg kv_id "${kv_id}" \
-                '{
-                  deployment_configs: {
-                    production: {
-                      env_vars: {
-                        ADMIN: {
-                          type: "plain_text",
-                          value: $admin
-                        },
-                        URL: {
-                          type: "plain_text",
-                          value: $url
-                        },
-                        PRELOAD_RACE_DIAL: {
-                          type: "plain_text",
-                          value: $preload
-                        },
-                        TCP_CONCURRENT_DIAL: {
-                          type: "plain_text",
-                          value: $tcp
-                        },
-                        PROXY_CONCURRENT_DIAL: {
-                          type: "plain_text",
-                          value: $proxy
-                        }
-                      },
-                      kv_namespaces: {
-                        KV: {
-                          namespace_id: $kv_id
-                        }
-                      }
-                    }
-                  }
-                }'
+                '{deployment_configs:{production:{
+                  env_vars:{
+                    ADMIN:{type:"plain_text",value:$admin},
+                    URL:{type:"plain_text",value:$url},
+                    PRELOAD_RACE_DIAL:{type:"plain_text",value:$preload},
+                    TCP_CONCURRENT_DIAL:{type:"plain_text",value:$tcp},
+                    PROXY_CONCURRENT_DIAL:{type:"plain_text",value:$proxy}
+                  },
+                  kv_namespaces:{KV:{namespace_id:$kv_id}}
+                }}}'
             )"
 
-            if [[ "${UUID_VALID}" == true &&
-                  "${project_name}" != "${UUID_TARGET_INDEX}" ]]; then
+            UUID_CHECK_REQUIRED=false
+            if [[ "${UUID_VALID}" == true && "${project_name}" != "${UUID_TARGET_INDEX}" ]]; then
               config_patch="$(
-                jq \
-                  --arg uuid "${UUID_VALUE}" \
-                  '.deployment_configs.production.env_vars.UUID = {
-                     type: "plain_text",
-                     value: $uuid
-                   }' \
+                jq --arg uuid "${UUID_VALUE}" \
+                  '.deployment_configs.production.env_vars.UUID={type:"plain_text",value:$uuid}' \
                   <<< "${config_patch}"
               )"
+              UUID_CHECK_REQUIRED=true
             fi
 
             config_patch_resp="$(
-              api_patch \
-                "${index}" \
+              api_patch "${index}" \
                 "${API_BASE}/accounts/${account_id}/pages/projects/${project_name}" \
                 "${config_patch}"
             )"
 
-            if ! jq -e '.success == true' \
-              >/dev/null <<< "${config_patch_resp}"; then
-              echo "❌ Pages 变量/KV 配置失败："
-              jq -c '{success,errors,messages}' \
-                <<< "${config_patch_resp}" 2>/dev/null || true
+            if ! jq -e '.success == true' >/dev/null <<< "${config_patch_resp}"; then
+              echo "❌ Pages 环境变量/KV 配置失败："
+              jq -c '{success,errors,messages}' <<< "${config_patch_resp}" 2>/dev/null || true
               return 1
             fi
 
-            echo "✅ Pages 生产环境变量与 KV 配置完成。"
+            if ! verify_env_vars "${index}" "${ADMIN_PASS}" "${DEFAULT_URL}" "${PRELOAD_RACE_DIAL}" "${TCP_CONCURRENT_DIAL}" "${PROXY_CONCURRENT_DIAL}" "${UUID_CHECK_REQUIRED}" "${UUID_VALUE}"; then
+              echo "⚠️ Pages 环境变量回读验证失败，正在完整重写一次..."
+              config_patch_resp="$(
+                api_patch "${index}" \
+                  "${API_BASE}/accounts/${account_id}/pages/projects/${project_name}" \
+                  "${config_patch}"
+              )"
 
+              if ! jq -e '.success == true' >/dev/null <<< "${config_patch_resp}" || \
+                 ! verify_env_vars "${index}" "${ADMIN_PASS}" "${DEFAULT_URL}" "${PRELOAD_RACE_DIAL}" "${TCP_CONCURRENT_DIAL}" "${PROXY_CONCURRENT_DIAL}" "${UUID_CHECK_REQUIRED}" "${UUID_VALUE}"; then
+                echo "❌ Pages 环境变量写入后二次验证仍失败。"
+                jq -c '{success,errors,messages}' <<< "${config_patch_resp}" 2>/dev/null || true
+                return 1
+              fi
+            fi
+
+            echo "✅ Pages 环境变量已写入并验证：ADMIN / URL / PRELOAD_RACE_DIAL / TCP_CONCURRENT_DIAL / PROXY_CONCURRENT_DIAL${UUID_CHECK_REQUIRED:+ / UUID}"
+            echo "✅ Pages KV 配置已写入。"
+
+            # ----------------------------------------------------------
+            # 4. 生成项目专用 Wrangler 配置
+            # ----------------------------------------------------------
+            # 5. 生成项目专用 Wrangler 配置
             # ----------------------------------------------------------
             # 4. 生成项目专用 Wrangler 配置
             # ----------------------------------------------------------
@@ -715,80 +731,67 @@ jobs:
             fi
 
             # ----------------------------------------------------------
-            # 6. 重新读取项目，验证 KV，避免“命令成功但绑定没落地”
-            # ----------------------------------------------------------
-            project_resp="$(
-              api_get \
-                "${index}" \
-                "${API_BASE}/accounts/${account_id}/pages/projects/${project_name}"
-            )" || {
-              echo "❌ 部署成功后无法读取 Pages 项目。"
+                    # 6. 重新读取项目，验证 5 个环境变量 + UUID（如有）+ KV
+          # ----------------------------------------------------------
+          project_resp="$(
+            api_get "${index}" \
+              "${API_BASE}/accounts/${account_id}/pages/projects/${project_name}"
+          )" || {
+            echo "❌ 部署成功后无法读取 Pages 项目。"
+            return 1
+          }
+
+          if ! jq -e \
+            --arg admin "${ADMIN_PASS}" --arg url "${DEFAULT_URL}" \
+            --arg preload "${PRELOAD_RACE_DIAL}" --arg tcp "${TCP_CONCURRENT_DIAL}" \
+            --arg proxy "${PROXY_CONCURRENT_DIAL}" --arg kv_id "${kv_id}" \
+            --arg uuid "${UUID_VALUE}" --argjson uuid_required "${UUID_CHECK_REQUIRED}" \
+            '.success == true
+             and (.result.deployment_configs.production.env_vars.ADMIN.value // "") == $admin
+             and (.result.deployment_configs.production.env_vars.URL.value // "") == $url
+             and (.result.deployment_configs.production.env_vars.PRELOAD_RACE_DIAL.value // "") == $preload
+             and (.result.deployment_configs.production.env_vars.TCP_CONCURRENT_DIAL.value // "") == $tcp
+             and (.result.deployment_configs.production.env_vars.PROXY_CONCURRENT_DIAL.value // "") == $proxy
+             and ($uuid_required == false or (.result.deployment_configs.production.env_vars.UUID.value // "") == $uuid)
+             and (.result.deployment_configs.production.kv_namespaces.KV.namespace_id // "") == $kv_id' \
+            >/dev/null <<< "${project_resp}"; then
+            echo "⚠️ 部署后配置回读验证失败，尝试完整重写 + 再部署一次..."
+
+            config_patch_resp="$(
+              api_patch "${index}" \
+                "${API_BASE}/accounts/${account_id}/pages/projects/${project_name}" \
+                "${config_patch}"
+            )"
+            if ! jq -e '.success == true' >/dev/null <<< "${config_patch_resp}"; then
+              echo "❌ 完整重写 Pages 配置失败："
+              jq -c '{success,errors,messages}' <<< "${config_patch_resp}" 2>/dev/null || true
               return 1
-            }
-
-            if ! jq -e \
-              --arg kv_id "${kv_id}" \
-              '.success == true
-               and (
-                 .result.deployment_configs.production.kv_namespaces.KV.namespace_id
-                 // ""
-               ) == $kv_id' \
-              >/dev/null <<< "${project_resp}"; then
-              echo "⚠️ KV 绑定未验证通过，正在补写并重新部署..."
-
-              config_patch_resp="$(
-                api_patch \
-                  "${index}" \
-                  "${API_BASE}/accounts/${account_id}/pages/projects/${project_name}" \
-                  "$(jq -nc \
-                    --arg kv_id "${kv_id}" \
-                    '{
-                      deployment_configs: {
-                        production: {
-                          kv_namespaces: {
-                            KV: {
-                              namespace_id: $kv_id
-                            }
-                          }
-                        }
-                      }
-                    }')"
-              )"
-
-              if ! jq -e '.success == true' \
-                >/dev/null <<< "${config_patch_resp}"; then
-                echo "❌ 重写 KV 绑定失败："
-                jq -c '{success,errors,messages}' \
-                  <<< "${config_patch_resp}" 2>/dev/null || true
-                return 1
-              fi
-
-              if ! (
-                cd "${PAYLOAD_DIR}"
-                run_pages_deploy "${index}"
-              ); then
-                echo "❌ KV 绑定修复后的重新部署失败。"
-                return 1
-              fi
-
-              project_resp="$(
-                api_get \
-                  "${index}" \
-                  "${API_BASE}/accounts/${account_id}/pages/projects/${project_name}"
-              )"
-
-              if ! jq -e \
-                --arg kv_id "${kv_id}" \
-                '.success == true
-                 and (
-                   .result.deployment_configs.production.kv_namespaces.KV.namespace_id
-                   // ""
-                 ) == $kv_id' \
-                >/dev/null <<< "${project_resp}"; then
-                echo "❌ KV 绑定验证仍然失败：binding=KV"
-                return 1
-              fi
             fi
+
+            if ! (cd "${PAYLOAD_DIR}" && run_pages_deploy "${index}"); then
+              echo "❌ 完整重写后的重新部署失败。"
+              return 1
+            fi
+
+            project_resp="$(api_get "${index}" "${API_BASE}/accounts/${account_id}/pages/projects/${project_name}")" || return 1
+            if ! jq -e \
+              --arg admin "${ADMIN_PASS}" --arg url "${DEFAULT_URL}" \
+              --arg preload "${PRELOAD_RACE_DIAL}" --arg tcp "${TCP_CONCURRENT_DIAL}" \
+              --arg proxy "${PROXY_CONCURRENT_DIAL}" --arg kv_id "${kv_id}" \
+              --arg uuid "${UUID_VALUE}" --argjson uuid_required "${UUID_CHECK_REQUIRED}" \
+              '.success == true
+               and (.result.deployment_configs.production.env_vars.ADMIN.value // "") == $admin
+               and (.result.deployment_configs.production.env_vars.URL.value // "") == $url
+               and (.result.deployment_configs.production.env_vars.PRELOAD_RACE_DIAL.value // "") == $preload
+               and (.result.deployment_configs.production.env_vars.TCP_CONCURRENT_DIAL.value // "") == $tcp
+               and (.result.deployment_configs.production.env_vars.PROXY_CONCURRENT_DIAL.value // "") == $proxy
+               and ($uuid_required == false or (.result.deployment_configs.production.env_vars.UUID.value // "") == $uuid)
+               and (.result.deployment_configs.production.kv_namespaces.KV.namespace_id // "") == $kv_id' \
+              >/dev/null <<< "${project_resp}"; then
+              echo "❌ 第二次回读验证仍失败：Pages 配置没有完全落地。"
+              return 1
+            fi
+          fi
 
             echo "✅ KV 绑定验证通过：KV -> ${kv_id}"
 
