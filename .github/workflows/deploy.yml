@@ -71,6 +71,15 @@ jobs:
           # ==========================================================
           # 【可修改配置区】
           # ==========================================================
+          # 说明：
+          # 1. UUID_CONFIG 不在这里写死，始终读取 GitHub Secret：UUID。
+          # 2. UUID Secret 格式保持不变：项目序号:UUIDv4
+          #      例如：1:d8b81c2e-2cd7-4537-8594-239fc5654021
+          # 3. UUID_CONFIG 指定的项目是“UUID 提供项目”。
+          #      该项目：必须有 ADMIN，但 Wrangler 配置中不写 UUID。
+          # 4. 其他项目：写入同一个 UUID，但不写 ADMIN。
+          # 5. 不硬编码 UUID 提供项目必须是 1；1/2/3/... 均可。
+          # ==========================================================
           readonly UPSTREAM_REPO="cmliu/edgetunnel"
           readonly UPSTREAM_BRANCH="beta2.1"
           readonly DEFAULT_URL="https://cloudflare-error-page-3th.pages.dev"
@@ -86,6 +95,7 @@ jobs:
           : "${CF_ACCOUNTS:?❌ 未检测到 CF_ACCOUNTS Secrets 变量}"
           : "${ADMIN_PASS:?❌ 未检测到 ADMIN Secrets 变量}"
           : "${GITHUB_TOKEN:?❌ 未检测到 GITHUB_TOKEN 变量}"
+          : "${UUID_CONFIG:=}"
 
           if [[ ! -x "${WRANGLER_BIN}" ]]; then
             echo "❌ Wrangler 未正确安装：${WRANGLER_BIN}"
@@ -120,6 +130,9 @@ jobs:
           echo "📦 KV：${KV_NAME}"
           echo "=================================================="
 
+          # ==========================================================
+          # 临时目录
+          # ==========================================================
           WORK_DIR="$(mktemp -d "${RUNNER_TEMP}/edgetunnel-deploy.XXXXXX")"
           trap 'rm -rf "${WORK_DIR}"' EXIT
 
@@ -144,7 +157,13 @@ jobs:
           unzip -tq "${SOURCE_ZIP}"
           unzip -q "${SOURCE_ZIP}" -d "${SOURCE_DIR}"
 
-          PAYLOAD_DIR="$([ -d "${SOURCE_DIR}" ] && find "${SOURCE_DIR}" -mindepth 1 -maxdepth 1 -type d -print -quit)"
+          PAYLOAD_DIR="$(
+            find "${SOURCE_DIR}" \
+              -mindepth 1 \
+              -maxdepth 1 \
+              -type d \
+              -print -quit
+          )"
 
           if [[ -z "${PAYLOAD_DIR}" || ! -d "${PAYLOAD_DIR}" ]]; then
             echo "❌ ZIP 结构异常，无法找到项目目录。"
@@ -157,7 +176,11 @@ jobs:
             exit 1
           fi
 
-          rm -f "${PAYLOAD_DIR}/wrangler.toml" "${PAYLOAD_DIR}/wrangler.json" "${PAYLOAD_DIR}/wrangler.jsonc"
+          # 上游 Wrangler 配置不直接继承；每个项目使用本 workflow 生成的完整配置。
+          rm -f \
+            "${PAYLOAD_DIR}/wrangler.toml" \
+            "${PAYLOAD_DIR}/wrangler.json" \
+            "${PAYLOAD_DIR}/wrangler.jsonc"
 
           SOURCE_SHA="$(sha256sum "${SOURCE_ZIP}" | awk '{print $1}')"
           readonly COMPATIBILITY_DATE="$(date -u -d '1 day ago' +%Y-%m-%d)"
@@ -183,6 +206,8 @@ jobs:
 
           # ==========================================================
           # 解析 CF_ACCOUNTS
+          #
+          # 支持：
           #   ACCOUNT_ID:API_TOKEN
           #   ACCOUNT_ID:GLOBAL_API_KEY:EMAIL
           # ==========================================================
@@ -200,6 +225,7 @@ jobs:
 
           while IFS= read -r raw_line || [[ -n "${raw_line}" ]]; do
             line="$(trim "${raw_line}")"
+
             [[ -z "${line}" ]] && continue
             [[ "${line}" =~ ^# ]] && continue
 
@@ -207,6 +233,7 @@ jobs:
             credential=""
             email=""
             extra=""
+
             IFS=':' read -r account_id credential email extra <<< "${line}"
 
             account_id="$(trim "${account_id}")"
@@ -260,47 +287,53 @@ jobs:
 
           # ==========================================================
           # UUID 配置
-          # UUID_CONFIG：项目序号:UUIDv4
-          # 目标项目会先校验现有 UUID 必须与 Secret 一致；
-          # 随后所有项目都明确写入同一个 UUID，避免 Wrangler 配置源
-          # 因遗漏 UUID 而清掉已有值。
+          #
+          # UUID_CONFIG 格式严格保持：项目序号:UUIDv4
+          # 例如：1:d8b81c2e-2cd7-4537-8594-239fc5654021
+          #
+          # 注意：
+          # - 不硬编码 UUID 提供项目必须是 1。
+          # - 不尝试从 Cloudflare / Pages 面板“获取”UUID。
+          # - UUID 是用户自己从面板取得后放入 GitHub Secret UUID 的。
+          # - 提供项目本身不写 UUID；其他项目写同一个 UUID。
           # ==========================================================
-          UUID_TARGET_INDEX=""
-          UUID_VALUE=""
+          UUID_SOURCE_INDEX=""
+          SHARED_UUID=""
           UUID_VALID=false
 
-          if [[ -n "${UUID_CONFIG:-}" ]]; then
+          if [[ -n "${UUID_CONFIG}" ]]; then
             if [[ "${UUID_CONFIG}" =~ ^([0-9]+):([[:xdigit:]]{8}-[[:xdigit:]]{4}-4[[:xdigit:]]{3}-[89abAB][[:xdigit:]]{3}-[[:xdigit:]]{12})$ ]]; then
-              UUID_TARGET_INDEX="${BASH_REMATCH[1]}"
-              UUID_VALUE="${BASH_REMATCH[2]}"
+              UUID_SOURCE_INDEX="${BASH_REMATCH[1]}"
+              SHARED_UUID="${BASH_REMATCH[2]}"
 
-              if (( UUID_TARGET_INDEX >= 1 && UUID_TARGET_INDEX <= ACCOUNT_COUNT )); then
+              if (( UUID_SOURCE_INDEX >= 1 && UUID_SOURCE_INDEX <= ACCOUNT_COUNT )); then
                 UUID_VALID=true
-                echo "🧩 UUID 聚合：来源项目=${UUID_TARGET_INDEX}"
-                echo "   其他项目统一使用同一个 UUID。"
+                echo "🧩 UUID 提供项目：${UUID_SOURCE_INDEX}"
+                echo "   其他项目将统一使用 UUID Secret 提供的固定 UUID。"
               else
-                echo "⚠️ UUID 项目序号 ${UUID_TARGET_INDEX} 超出当前账号数量。"
-                echo "⚠️ 本次跳过 UUID 聚合。"
+                echo "❌ UUID 项目序号 ${UUID_SOURCE_INDEX} 超出当前账号数量 1..${ACCOUNT_COUNT}。"
+                exit 1
               fi
             else
-              echo "⚠️ UUID 配置格式无效。"
-              echo "⚠️ 正确格式：项目序号:UUIDv4"
-              echo "⚠️ 本次跳过 UUID 聚合。"
+              echo "❌ UUID Secret 格式无效。"
+              echo "❌ 正确格式：项目序号:UUIDv4"
+              echo "❌ 示例：1:d8b81c2e-2cd7-4537-8594-239fc5654021"
+              exit 1
             fi
           else
-            echo "ℹ️ 未配置 UUID 聚合。"
+            echo "ℹ️ 未配置 UUID 聚合：所有项目都不写 UUID。"
           fi
 
           # ==========================================================
           # Cloudflare API
-          # GET 使用重试；POST/PATCH 不使用自动重试，避免非幂等操作
-          # 因超时重复创建资源。
+          # GET 使用重试；POST 不使用自动重试，避免非幂等创建重复资源。
           # ==========================================================
           api_request() {
             local index="$1"
             local method="$2"
             local url="$3"
             local data="${4:-}"
+
             local -a headers=("-H" "Content-Type: application/json")
 
             if [[ "${AUTH_TYPES[$index]}" == "global_key" ]]; then
@@ -323,50 +356,82 @@ jobs:
             fi
 
             if [[ -n "${data}" ]]; then
-              curl -sS \
+              curl -fsSL \
                 -X "${method}" \
                 "${headers[@]}" \
                 --data "${data}" \
                 "${url}"
             else
-              curl -sS \
+              curl -fsSL \
                 -X "${method}" \
                 "${headers[@]}" \
                 "${url}"
             fi
           }
 
-          api_get() { api_request "$1" GET "$2"; }
-          api_post() { api_request "$1" POST "$2" "$3"; }
+          api_get() {
+            api_request "$1" GET "$2"
+          }
+
+          api_post() {
+            api_request "$1" POST "$2" "$3"
+          }
+
+          # GET 项目时需要区分 200 / 404 / 其他 HTTP 错误。
+          # 只有 404 才允许进入“创建 Pages 项目”流程。
+          api_get_status() {
+            local index="$1"
+            local url="$2"
+            local body_file="$3"
+
+            local -a headers=("-H" "Content-Type: application/json")
+
+            if [[ "${AUTH_TYPES[$index]}" == "global_key" ]]; then
+              headers+=(
+                "-H" "X-Auth-Email: ${AUTH_EMAILS[$index]}"
+                "-H" "X-Auth-Key: ${CREDENTIALS[$index]}"
+              )
+            else
+              headers+=("-H" "Authorization: Bearer ${CREDENTIALS[$index]}")
+            fi
+
+            curl -sS \
+              --retry 4 \
+              --retry-all-errors \
+              --retry-delay 2 \
+              "${headers[@]}" \
+              -o "${body_file}" \
+              -w '%{http_code}' \
+              "${url}"
+          }
 
           # ==========================================================
           # 生成完整 Wrangler 配置
-          # 说明：Pages 官方文档要求使用 Wrangler 配置文件时把它视为
-          # 项目配置的 source of truth；vars / kv_namespaces 应直接写入。
+          #
+          # Cloudflare Pages 使用 Wrangler 配置文件后，该文件成为 source of truth。
+          # 因此所有要交给 Wrangler 管理的生产变量与 KV 都必须写进配置。
           # ==========================================================
           write_wrangler_config() {
-            local index="$1"
-            local project_name="$2"
-            local kv_id="$3"
-            local uuid_value="${4:-}"
-
+            local project_name="$1"
+            local kv_id="$2"
+            local shared_uuid="${3:-}"
+            local include_admin="$4"
             local config_file="${PAYLOAD_DIR}/wrangler.json"
 
-            if [[ -n "${uuid_value}" ]]; then
+            if [[ "${include_admin}" == "true" && -n "${shared_uuid}" ]]; then
               jq -n \
                 --arg name "${project_name}" \
-                --arg output "." \
                 --arg compatibility_date "${COMPATIBILITY_DATE}" \
                 --arg admin "${ADMIN_PASS}" \
                 --arg url "${DEFAULT_URL}" \
                 --arg preload "${PRELOAD_RACE_DIAL}" \
                 --arg tcp "${TCP_CONCURRENT_DIAL}" \
                 --arg proxy "${PROXY_CONCURRENT_DIAL}" \
-                --arg uuid "${uuid_value}" \
+                --arg uuid "${shared_uuid}" \
                 --arg kv_id "${kv_id}" \
                 '{
                   name: $name,
-                  pages_build_output_dir: $output,
+                  pages_build_output_dir: ".",
                   compatibility_date: $compatibility_date,
                   vars: {
                     ADMIN: $admin,
@@ -380,11 +445,10 @@ jobs:
                     {binding: "KV", id: $kv_id}
                   ]
                 }' > "${config_file}"
-              echo "📄 Wrangler 配置已生成：5 个变量 + UUID + KV"
-            else
+
+            elif [[ "${include_admin}" == "true" ]]; then
               jq -n \
                 --arg name "${project_name}" \
-                --arg output "." \
                 --arg compatibility_date "${COMPATIBILITY_DATE}" \
                 --arg admin "${ADMIN_PASS}" \
                 --arg url "${DEFAULT_URL}" \
@@ -394,7 +458,7 @@ jobs:
                 --arg kv_id "${kv_id}" \
                 '{
                   name: $name,
-                  pages_build_output_dir: $output,
+                  pages_build_output_dir: ".",
                   compatibility_date: $compatibility_date,
                   vars: {
                     ADMIN: $admin,
@@ -407,12 +471,78 @@ jobs:
                     {binding: "KV", id: $kv_id}
                   ]
                 }' > "${config_file}"
-              echo "📄 Wrangler 配置已生成：5 个变量 + KV"
+
+            elif [[ -n "${shared_uuid}" ]]; then
+              jq -n \
+                --arg name "${project_name}" \
+                --arg compatibility_date "${COMPATIBILITY_DATE}" \
+                --arg url "${DEFAULT_URL}" \
+                --arg preload "${PRELOAD_RACE_DIAL}" \
+                --arg tcp "${TCP_CONCURRENT_DIAL}" \
+                --arg proxy "${PROXY_CONCURRENT_DIAL}" \
+                --arg uuid "${shared_uuid}" \
+                --arg kv_id "${kv_id}" \
+                '{
+                  name: $name,
+                  pages_build_output_dir: ".",
+                  compatibility_date: $compatibility_date,
+                  vars: {
+                    URL: $url,
+                    PRELOAD_RACE_DIAL: $preload,
+                    TCP_CONCURRENT_DIAL: $tcp,
+                    PROXY_CONCURRENT_DIAL: $proxy,
+                    UUID: $uuid
+                  },
+                  kv_namespaces: [
+                    {binding: "KV", id: $kv_id}
+                  ]
+                }' > "${config_file}"
+
+            else
+              jq -n \
+                --arg name "${project_name}" \
+                --arg compatibility_date "${COMPATIBILITY_DATE}" \
+                --arg url "${DEFAULT_URL}" \
+                --arg preload "${PRELOAD_RACE_DIAL}" \
+                --arg tcp "${TCP_CONCURRENT_DIAL}" \
+                --arg proxy "${PROXY_CONCURRENT_DIAL}" \
+                --arg kv_id "${kv_id}" \
+                '{
+                  name: $name,
+                  pages_build_output_dir: ".",
+                  compatibility_date: $compatibility_date,
+                  vars: {
+                    URL: $url,
+                    PRELOAD_RACE_DIAL: $preload,
+                    TCP_CONCURRENT_DIAL: $tcp,
+                    PROXY_CONCURRENT_DIAL: $proxy
+                  },
+                  kv_namespaces: [
+                    {binding: "KV", id: $kv_id}
+                  ]
+                }' > "${config_file}"
             fi
 
             jq empty "${config_file}"
+
+            if [[ "${include_admin}" == "true" ]]; then
+              if [[ -n "${shared_uuid}" ]]; then
+                echo "📄 Wrangler 配置：ADMIN + 4 公共变量 + UUID + KV"
+              else
+                echo "📄 Wrangler 配置：ADMIN + 3 公共变量 + KV（不写 UUID）"
+              fi
+            else
+              if [[ -n "${shared_uuid}" ]]; then
+                echo "📄 Wrangler 配置：4 公共变量 + UUID + KV（不写 ADMIN）"
+              else
+                echo "📄 Wrangler 配置：3 公共变量 + KV（不写 ADMIN / UUID）"
+              fi
+            fi
           }
 
+          # ==========================================================
+          # Pages 部署
+          # ==========================================================
           run_pages_deploy() {
             local index="$1"
             local account_id="${ACCOUNT_IDS[$index]}"
@@ -443,7 +573,7 @@ jobs:
 
           # ==========================================================
           # 获取 Pages 自定义域
-          # 优先 active 非 pages.dev，自定义域不可用时回退 subdomain。
+          # active 的非 pages.dev 自定义域优先，否则 pages.dev。
           # ==========================================================
           get_preferred_domain() {
             local index="$1"
@@ -455,7 +585,11 @@ jobs:
 
             pages_subdomain="$(jq -r '.result.subdomain // empty' <<< "${project_json}")"
 
-            if domains_json="$(api_get "${index}" "${API_BASE}/accounts/${ACCOUNT_IDS[$index]}/pages/projects/${project_name}/domains")"; then
+            if domains_json="$(
+              api_get \
+                "${index}" \
+                "${API_BASE}/accounts/${ACCOUNT_IDS[$index]}/pages/projects/${project_name}/domains"
+            )"; then
               custom_domain="$(
                 jq -r '
                   [
@@ -482,54 +616,62 @@ jobs:
           }
 
           # ==========================================================
-          # 输出实际配置诊断（不打印 ADMIN 等敏感值）
+          # 配置验证
+          # 注意：
+          # - UUID 提供项目不验证 UUID，因为它按设计不写 UUID。
+          # - 非提供项目必须验证 UUID。
+          # - ADMIN 只有 UUID 提供项目必须验证。
           # ==========================================================
-          print_config_mismatch() {
+          verify_production_config() {
             local project_json="$1"
-            local expected_kv="$2"
+            local expect_admin="$2"
             local expect_uuid="$3"
+            local expect_kv="$4"
+            local expected_admin="${ADMIN_PASS}"
 
-            echo "🔎 Cloudflare 实际生产配置摘要："
+            jq -e \
+              --arg admin "${expected_admin}" \
+              --arg expect_admin "${expect_admin}" \
+              --arg uuid "${expect_uuid}" \
+              --arg kv_id "${expect_kv}" \
+              --arg url "${DEFAULT_URL}" \
+              --arg preload "${PRELOAD_RACE_DIAL}" \
+              --arg tcp "${TCP_CONCURRENT_DIAL}" \
+              --arg proxy "${PROXY_CONCURRENT_DIAL}" \
+              '.success == true
+               and (.result.deployment_configs.production.env_vars.URL.value // "") == $url
+               and (.result.deployment_configs.production.env_vars.PRELOAD_RACE_DIAL.value // "") == $preload
+               and (.result.deployment_configs.production.env_vars.TCP_CONCURRENT_DIAL.value // "") == $tcp
+               and (.result.deployment_configs.production.env_vars.PROXY_CONCURRENT_DIAL.value // "") == $proxy
+               and (.result.deployment_configs.production.kv_namespaces.KV.namespace_id // "") == $kv_id
+               and ($expect_admin != "true" or (.result.deployment_configs.production.env_vars.ADMIN.value // "") == $admin)
+               and ($expect_uuid == "" or (.result.deployment_configs.production.env_vars.UUID.value // "") == $uuid)' \
+              >/dev/null <<< "${project_json}"
+          }
+
+          print_config_summary() {
+            local project_json="$1"
+
+            echo "🔎 Cloudflare 实际生产配置摘要（不输出敏感值）："
             jq -c '
               {
                 success,
-                production: {
-                  env_var_keys: ((.result.deployment_configs.production.env_vars // {}) | keys),
-                  kv_namespaces: (.result.deployment_configs.production.kv_namespaces // {})
-                },
+                env_var_keys: (.result.deployment_configs.production.env_vars // {} | keys),
+                kv_namespaces: (.result.deployment_configs.production.kv_namespaces // {}),
                 wrangler_config_hash: (.result.wrangler_config_hash // null),
                 errors,
                 messages
               }
             ' <<< "${project_json}" 2>/dev/null || true
-
-            echo "🔎 字段校验结果："
-            jq -r \
-              --arg admin "${ADMIN_PASS}" \
-              --arg url "${DEFAULT_URL}" \
-              --arg preload "${PRELOAD_RACE_DIAL}" \
-              --arg tcp "${TCP_CONCURRENT_DIAL}" \
-              --arg proxy "${PROXY_CONCURRENT_DIAL}" \
-              --arg kv "${expected_kv}" \
-              --arg uuid "${expect_uuid}" \
-              '
-                .result.deployment_configs.production as $p |
-                [
-                  ["ADMIN", (($p.env_vars.ADMIN.value // "") == $admin)],
-                  ["URL", (($p.env_vars.URL.value // "") == $url)],
-                  ["PRELOAD_RACE_DIAL", (($p.env_vars.PRELOAD_RACE_DIAL.value // "") == $preload)],
-                  ["TCP_CONCURRENT_DIAL", (($p.env_vars.TCP_CONCURRENT_DIAL.value // "") == $tcp)],
-                  ["PROXY_CONCURRENT_DIAL", (($p.env_vars.PROXY_CONCURRENT_DIAL.value // "") == $proxy)],
-                  ["KV", (($p.kv_namespaces.KV.namespace_id // "") == $kv)]
-                ] +
-                (if $uuid != "" then [["UUID", (($p.env_vars.UUID.value // "") == $uuid)]] else [] end)
-                | .[] | "   \(. [0]): \(if .[1] then "OK" else "MISMATCH" end)"
-              ' <<< "${project_json}" 2>/dev/null || true
           }
 
+          # ==========================================================
+          # 结果数组
+          # ==========================================================
           declare -a ADMIN_DOMAINS=()
           declare -a HOST_DOMAINS=()
           declare -a FAILED_PROJECTS=()
+
           DEPLOYED_COUNT=0
 
           # ==========================================================
@@ -539,6 +681,7 @@ jobs:
             local index="$1"
             local account_id="${ACCOUNT_IDS[$index]}"
             local project_name="$((index + 1))"
+
             local project_resp=""
             local create_resp=""
             local kv_list=""
@@ -546,7 +689,8 @@ jobs:
             local host=""
             local final_url=""
             local deploy_uuid=""
-            local existing_uuid=""
+            local include_admin="false"
+            local expected_admin="false"
 
             echo ""
             echo "=================================================="
@@ -555,43 +699,124 @@ jobs:
             echo "   Pages 项目: ${project_name}"
             echo "=================================================="
 
+            if [[ "${UUID_VALID}" == true && "${project_name}" == "${UUID_SOURCE_INDEX}" ]]; then
+              include_admin="true"
+              expected_admin="true"
+            elif [[ "${UUID_VALID}" == true ]]; then
+              include_admin="false"
+            else
+              # 没有 UUID 聚合时，为兼容原有独立面板工作方式，所有项目都保留 ADMIN。
+              include_admin="true"
+              expected_admin="true"
+            fi
+
+            if [[ "${UUID_VALID}" == true && "${project_name}" != "${UUID_SOURCE_INDEX}" ]]; then
+              deploy_uuid="${SHARED_UUID}"
+            else
+              deploy_uuid=""
+            fi
+
+            if [[ "${UUID_VALID}" == true ]]; then
+              if [[ "${project_name}" == "${UUID_SOURCE_INDEX}" ]]; then
+                echo "🧩 角色：UUID 提供项目"
+                echo "   ✅ 写入 ADMIN"
+                echo "   ✅ 不写 UUID"
+              else
+                echo "🧩 角色：UUID 聚合节点"
+                echo "   ✅ 写入固定 UUID"
+                echo "   ✅ 不写 ADMIN"
+              fi
+            else
+              echo "🧩 角色：独立项目（未启用 UUID 聚合）"
+              echo "   ✅ 写入 ADMIN"
+            fi
+
             # ----------------------------------------------------------
             # 1. 检查 / 创建 Pages 项目
             # ----------------------------------------------------------
-            if project_resp="$(api_get "${index}" "${API_BASE}/accounts/${account_id}/pages/projects/${project_name}")"; then
-              if jq -e '.success == true and (.result.name // "") != ""' >/dev/null <<< "${project_resp}"; then
-                echo "✅ Pages 项目已存在。"
-              else
-                project_resp=""
-              fi
-            else
-              project_resp=""
+            local project_body="${WORK_DIR}/project-${index}.json"
+            local project_http_status=""
+
+            if ! project_http_status="$(
+              api_get_status \
+                "${index}" \
+                "${API_BASE}/accounts/${account_id}/pages/projects/${project_name}" \
+                "${project_body}"
+            )"; then
+              echo "❌ 无法读取 Pages 项目 ${project_name}。"
+              return 1
             fi
 
-            if [[ -z "${project_resp}" ]]; then
-              echo "📁 Pages 项目不存在，正在创建..."
-              create_resp="$(
-                api_post \
-                  "${index}" \
-                  "${API_BASE}/accounts/${account_id}/pages/projects" \
-                  "$(jq -nc --arg name "${project_name}" --arg branch "${PAGES_PRODUCTION_BRANCH}" '{name:$name,production_branch:$branch}')"
-              )"
+            case "${project_http_status}" in
+              200)
+                project_resp="$(cat "${project_body}")"
+                if jq -e '.success == true and (.result.name // "") != ""' >/dev/null <<< "${project_resp}"; then
+                  echo "✅ Pages 项目已存在。"
+                else
+                  echo "❌ Pages 项目 API 返回异常："
+                  jq -c '{success,errors,messages}' <<< "${project_resp}" 2>/dev/null || true
+                  return 1
+                fi
+                ;;
 
-              if ! jq -e '.success == true and (.result.name // "") != ""' >/dev/null <<< "${create_resp}"; then
-                echo "❌ 创建 Pages 项目失败："
-                jq -c '{success,errors,messages}' <<< "${create_resp}" 2>/dev/null || true
+              404)
+                echo "📁 Pages 项目不存在，正在创建..."
+
+                create_resp="$(
+                  api_post \
+                    "${index}" \
+                    "${API_BASE}/accounts/${account_id}/pages/projects" \
+                    "$(jq -nc --arg name "${project_name}" --arg branch "${PAGES_PRODUCTION_BRANCH}" '{name:$name,production_branch:$branch}')"
+                )" || {
+                  echo "❌ 创建 Pages 项目请求失败。"
+                  return 1
+                }
+
+                if ! jq -e '.success == true and (.result.name // "") != ""' >/dev/null <<< "${create_resp}"; then
+                  echo "❌ 创建 Pages 项目失败："
+                  jq -c '{success,errors,messages}' <<< "${create_resp}" 2>/dev/null || true
+                  return 1
+                fi
+
+                project_resp="${create_resp}"
+                echo "✅ Pages 项目创建成功。"
+                ;;
+
+              401|403)
+                echo "❌ Cloudflare API 认证/权限错误（HTTP ${project_http_status}），不会创建 Pages 项目。"
+                cat "${project_body}" | jq -c '{success,errors,messages}' 2>/dev/null || cat "${project_body}" || true
                 return 1
-              fi
+                ;;
 
-              project_resp="${create_resp}"
-              echo "✅ Pages 项目创建成功。"
-            fi
+              429)
+                echo "❌ Cloudflare API 限流（HTTP 429），不会把它误判成项目不存在。"
+                cat "${project_body}" | jq -c '{success,errors,messages}' 2>/dev/null || cat "${project_body}" || true
+                return 1
+                ;;
+
+              500|502|503|504)
+                echo "❌ Cloudflare API 服务端错误（HTTP ${project_http_status}），不会创建 Pages 项目。"
+                cat "${project_body}" | jq -c '{success,errors,messages}' 2>/dev/null || cat "${project_body}" || true
+                return 1
+                ;;
+
+              *)
+                echo "❌ 读取 Pages 项目返回未处理的 HTTP 状态：${project_http_status}"
+                cat "${project_body}" | jq -c '{success,errors,messages}' 2>/dev/null || cat "${project_body}" || true
+                return 1
+                ;;
+            esac
 
             # ----------------------------------------------------------
             # 2. 检查 / 创建 KV
             # ----------------------------------------------------------
             echo "📦 检查 KV：${KV_NAME}"
-            if ! kv_list="$(api_get "${index}" "${API_BASE}/accounts/${account_id}/storage/kv/namespaces")"; then
+
+            if ! kv_list="$(
+              api_get \
+                "${index}" \
+                "${API_BASE}/accounts/${account_id}/storage/kv/namespaces"
+            )"; then
               echo "❌ 无法读取 KV 列表。"
               return 1
             fi
@@ -602,10 +827,17 @@ jobs:
               return 1
             fi
 
-            kv_id="$(jq -r --arg title "${KV_NAME}" '.result[] | select(.title == $title) | .id' <<< "${kv_list}" | head -n 1)"
+            kv_id="$(
+              jq -r \
+                --arg title "${KV_NAME}" \
+                '.result[] | select(.title == $title) | .id' \
+                <<< "${kv_list}" |
+              head -n 1
+            )"
 
             if [[ -z "${kv_id}" || "${kv_id}" == "null" ]]; then
               echo "📦 未找到 '${KV_NAME}'，正在创建..."
+
               create_resp="$(
                 api_post \
                   "${index}" \
@@ -626,87 +858,74 @@ jobs:
             fi
 
             # ----------------------------------------------------------
-            # 3. 确定 UUID
+            # 3. 生成完整 Wrangler 配置
             # ----------------------------------------------------------
-            if [[ "${UUID_VALID}" == true ]]; then
-              if [[ "${project_name}" == "${UUID_TARGET_INDEX}" ]]; then
-                existing_uuid="$(jq -r '.result.deployment_configs.production.env_vars.UUID.value // empty' <<< "${project_resp}")"
-                if [[ -z "${existing_uuid}" ]]; then
-                  echo "❌ UUID 来源项目 ${project_name} 当前没有生产 UUID。"
-                  echo "❌ UUID Secret 指定了来源项目，因此不会猜测或自动生成 UUID。"
-                  return 1
-                fi
-
-                if [[ "${existing_uuid,,}" != "${UUID_VALUE,,}" ]]; then
-                  echo "❌ UUID 来源项目 ${project_name} 的现有 UUID 与 UUID Secret 不一致。"
-                  echo "❌ 为避免错误聚合，本次项目部署停止。"
-                  return 1
-                fi
-
-                deploy_uuid="${UUID_VALUE}"
-              else
-                deploy_uuid="${UUID_VALUE}"
-              fi
-            fi
+            write_wrangler_config \
+              "${project_name}" \
+              "${kv_id}" \
+              "${deploy_uuid}" \
+              "${include_admin}"
 
             # ----------------------------------------------------------
-            # 4. 生成完整 Wrangler 配置
-            # ----------------------------------------------------------
-            write_wrangler_config "${index}" "${project_name}" "${kv_id}" "${deploy_uuid}"
-
-            # ----------------------------------------------------------
-            # 5. 部署；仅在 Wrangler 本身失败时重试一次
+            # 4. 部署；仅在 Wrangler 本身失败时重试一次
             # ----------------------------------------------------------
             echo "🌐 正在部署 Pages 项目 ${project_name}..."
-            if ! (cd "${PAYLOAD_DIR}" && run_pages_deploy "${index}"); then
+
+            if ! (
+              cd "${PAYLOAD_DIR}"
+              run_pages_deploy "${index}"
+            ); then
               echo "⚠️ 第 ${project_name} 个项目首次部署失败，重试一次..."
-              if ! (cd "${PAYLOAD_DIR}" && run_pages_deploy "${index}"); then
+
+              if ! (
+                cd "${PAYLOAD_DIR}"
+                run_pages_deploy "${index}"
+              ); then
                 echo "❌ 第 ${project_name} 个项目部署失败。"
                 return 1
               fi
             fi
 
             # ----------------------------------------------------------
-            # 6. 部署后读取并严格验证生产配置
+            # 5. 部署后读取并严格验证实际生产配置
             # ----------------------------------------------------------
-            project_resp="$(api_get "${index}" "${API_BASE}/accounts/${account_id}/pages/projects/${project_name}")" || {
+            project_resp="$(
+              api_get \
+                "${index}" \
+                "${API_BASE}/accounts/${account_id}/pages/projects/${project_name}"
+            )" || {
               echo "❌ 部署成功后无法读取 Pages 项目。"
               return 1
             }
 
-            if ! jq -e \
-              --arg admin "${ADMIN_PASS}" \
-              --arg url "${DEFAULT_URL}" \
-              --arg preload "${PRELOAD_RACE_DIAL}" \
-              --arg tcp "${TCP_CONCURRENT_DIAL}" \
-              --arg proxy "${PROXY_CONCURRENT_DIAL}" \
-              --arg kv_id "${kv_id}" \
-              --arg uuid "${deploy_uuid}" \
-              '.success == true
-               and (.result.deployment_configs.production.env_vars.ADMIN.value // "") == $admin
-               and (.result.deployment_configs.production.env_vars.URL.value // "") == $url
-               and (.result.deployment_configs.production.env_vars.PRELOAD_RACE_DIAL.value // "") == $preload
-               and (.result.deployment_configs.production.env_vars.TCP_CONCURRENT_DIAL.value // "") == $tcp
-               and (.result.deployment_configs.production.env_vars.PROXY_CONCURRENT_DIAL.value // "") == $proxy
-               and (.result.deployment_configs.production.kv_namespaces.KV.namespace_id // "") == $kv_id
-               and ($uuid == "" or (.result.deployment_configs.production.env_vars.UUID.value // "") == $uuid)' \
-              >/dev/null <<< "${project_resp}"; then
-              echo "❌ 部署后生产配置验证失败，不再用 API PATCH 与 Wrangler 反复覆盖。"
-              print_config_mismatch "${project_resp}" "${kv_id}" "${deploy_uuid}"
+            if ! verify_production_config \
+              "${project_resp}" \
+              "${expected_admin}" \
+              "${deploy_uuid}" \
+              "${kv_id}"; then
+              echo "❌ 部署后生产配置验证失败。"
+              echo "❌ 本次不再使用 API PATCH 强行覆盖，也不循环部署。"
+              print_config_summary "${project_resp}"
               return 1
             fi
 
-            if [[ -n "${deploy_uuid}" ]]; then
-              echo "✅ Pages 环境变量已随 Wrangler 部署并验证：ADMIN / URL / PRELOAD_RACE_DIAL / TCP_CONCURRENT_DIAL / PROXY_CONCURRENT_DIAL / UUID"
+            if [[ "${expected_admin}" == "true" && -n "${deploy_uuid}" ]]; then
+              echo "✅ Pages 环境变量已验证：ADMIN / URL / PRELOAD_RACE_DIAL / TCP_CONCURRENT_DIAL / PROXY_CONCURRENT_DIAL / UUID"
+            elif [[ "${expected_admin}" == "true" ]]; then
+              echo "✅ Pages 环境变量已验证：ADMIN / URL / PRELOAD_RACE_DIAL / TCP_CONCURRENT_DIAL / PROXY_CONCURRENT_DIAL"
+            elif [[ -n "${deploy_uuid}" ]]; then
+              echo "✅ Pages 环境变量已验证：URL / PRELOAD_RACE_DIAL / TCP_CONCURRENT_DIAL / PROXY_CONCURRENT_DIAL / UUID"
             else
-              echo "✅ Pages 环境变量已随 Wrangler 部署并验证：ADMIN / URL / PRELOAD_RACE_DIAL / TCP_CONCURRENT_DIAL / PROXY_CONCURRENT_DIAL"
+              echo "✅ Pages 环境变量已验证：URL / PRELOAD_RACE_DIAL / TCP_CONCURRENT_DIAL / PROXY_CONCURRENT_DIAL"
             fi
+
             echo "✅ Pages KV 绑定已验证：KV -> ${kv_id}"
 
             # ----------------------------------------------------------
-            # 7. 获取最终域名
+            # 6. 获取最终域名
             # ----------------------------------------------------------
             host=""
+
             for attempt in 1 2 3 4 5; do
               host="$(get_preferred_domain "${index}" "${project_name}" "${project_resp}" || true)"
               host="$(trim "${host}")"
@@ -718,7 +937,12 @@ jobs:
               if (( attempt < 5 )); then
                 echo "⏳ 获取最终域名第 ${attempt}/5 次失败，等待 2 秒..."
                 sleep 2
-                project_resp="$(api_get "${index}" "${API_BASE}/accounts/${account_id}/pages/projects/${project_name}" || true)"
+                project_resp="$(
+                  api_get \
+                    "${index}" \
+                    "${API_BASE}/accounts/${account_id}/pages/projects/${project_name}" \
+                    || true
+                )"
               fi
             done
 
@@ -738,11 +962,13 @@ jobs:
             fi
 
             final_url="https://${host}/admin"
+
             echo "🔗 管理地址：${final_url}"
             echo "🌐 Host：${host}"
 
             ADMIN_DOMAINS[$index]="${final_url}"
             HOST_DOMAINS[$index]="${host}"
+
             DEPLOYED_COUNT=$((DEPLOYED_COUNT + 1))
 
             echo "🎉 第 ${project_name} 个项目处理完成。"
@@ -771,13 +997,18 @@ jobs:
             rm -f domain.txt
           fi
 
+          # ==========================================================
+          # 读取旧 domain.txt
+          # ==========================================================
           declare -a OLD_ADMIN_DOMAINS=()
           declare -a OLD_HOST_DOMAINS=()
 
           if [[ -f domain.txt ]]; then
             section="admin"
+
             while IFS= read -r old_domain || [[ -n "${old_domain}" ]]; do
               old_domain="${old_domain%$'\r'}"
+
               if [[ -z "${old_domain}" ]]; then
                 section="host"
                 continue
@@ -801,22 +1032,29 @@ jobs:
             fi
           fi
 
-          # 失败项目保留旧域名，仅用于展示；但只要有失败，最终不提交 domain.txt。
+          # 失败项目仅保留旧值用于日志展示；只要有失败，最终不提交 domain.txt。
           for ((i=0; i<ACCOUNT_COUNT; i++)); do
             if [[ -z "${ADMIN_DOMAINS[$i]:-}" && -n "${OLD_ADMIN_DOMAINS[$i]:-}" ]]; then
               ADMIN_DOMAINS[$i]="${OLD_ADMIN_DOMAINS[$i]}"
             fi
+
             if [[ -z "${HOST_DOMAINS[$i]:-}" && -n "${OLD_HOST_DOMAINS[$i]:-}" ]]; then
               HOST_DOMAINS[$i]="${OLD_HOST_DOMAINS[$i]}"
             fi
           done
 
+          # ==========================================================
+          # 生成 domain.txt
+          # ==========================================================
           if (( ${#FAILED_PROJECTS[@]} == 0 )); then
             : > "${DOMAIN_NEXT}"
+
             for ((i=0; i<ACCOUNT_COUNT; i++)); do
               printf '%s\n' "${ADMIN_DOMAINS[$i]}" >> "${DOMAIN_NEXT}"
             done
+
             printf '\n' >> "${DOMAIN_NEXT}"
+
             for ((i=0; i<ACCOUNT_COUNT; i++)); do
               printf '%s\n' "${HOST_DOMAINS[$i]}" >> "${DOMAIN_NEXT}"
             done
@@ -825,6 +1063,9 @@ jobs:
             rm -f "${DOMAIN_NEXT}"
           fi
 
+          # ==========================================================
+          # 输出与提交
+          # ==========================================================
           echo ""
           echo "┌────┬─────────────────────────────────────────────────────┐"
           echo "│ ID │ 最终管理地址                                        │"
