@@ -417,9 +417,8 @@ jobs:
           # ==========================================================
           # 获取 Pages 自定义域
           #
-          # 优先：active 的非 pages.dev 域名
-          # 其次：已绑定但尚未 active 的非 pages.dev 域名
-          # 最后：Pages 原生 subdomain
+          # 优先：active 的非 pages.dev 自定义域名
+          # 如果自定义域尚未 active，则继续使用可用的 pages.dev 域名
           #
           # 这样用户后续手动绑定自定义域后，不需要再改 Secret。
           # ==========================================================
@@ -447,14 +446,10 @@ jobs:
                     | select(
                         (.name // "") != ""
                         and ((.name | ascii_downcase) | endswith(".pages.dev") | not)
+                        and (.status == "active")
                       )
                   ]
-                  | sort_by(
-                      if .status == "active" then 0
-                      elif .status == "pending" then 1
-                      else 2
-                      end
-                    )
+                  | sort_by(.name)
                   | .[0].name // empty
                 ' <<< "${domains_json}"
               )"
@@ -863,18 +858,19 @@ jobs:
           done
 
           # ==========================================================
-          # 防止期间有人更新 main / domain.txt：
-          # 同一 workflow 组内部已串行；这里再同步远端。
+          # 同步最新远端的 domain.txt
+          # 不 rebase 整个仓库，避免外部 push 导致无关冲突。
+          # 本 workflow 最终只需要提交 domain.txt。
           # ==========================================================
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
           git fetch origin "${GITHUB_REF_NAME}" --quiet
 
-          # 只处理“远端在本次 workflow 开始后新增的提交”。
-          # 如果本地已经跟随远端，则不执行 rebase。
-          if ! git merge-base --is-ancestor "HEAD" "origin/${GITHUB_REF_NAME}"; then
-            git rebase "origin/${GITHUB_REF_NAME}"
+          if git cat-file -e "origin/${GITHUB_REF_NAME}:domain.txt" 2>/dev/null; then
+            git checkout "origin/${GITHUB_REF_NAME}" -- domain.txt
+          else
+            rm -f domain.txt
           fi
 
           # ==========================================================
@@ -939,47 +935,58 @@ jobs:
 
           # ==========================================================
           # 生成 domain.txt
-          # 不排序、不去重，严格按项目序号 1..N 输出，
-          # 所以新增账号会自然追加在对应序号位置。
+          # 严格按项目序号 1..N 输出，不排序、不去重。
+          # 若本次有失败项目，不更新文件，避免列表错位。
           # ==========================================================
-          : > "${DOMAIN_NEXT}"
+          if (( ${#FAILED_PROJECTS[@]} == 0 )); then
+            : > "${DOMAIN_NEXT}"
 
-          for ((i=0; i<ACCOUNT_COUNT; i++)); do
-            if [[ -n "${ADMIN_DOMAINS[$i]:-}" ]]; then
+            for ((i=0; i<ACCOUNT_COUNT; i++)); do
               printf '%s\n' "${ADMIN_DOMAINS[$i]}" >> "${DOMAIN_NEXT}"
-            fi
-          done
+            done
 
-          printf '\n' >> "${DOMAIN_NEXT}"
+            printf '\n' >> "${DOMAIN_NEXT}"
 
-          for ((i=0; i<ACCOUNT_COUNT; i++)); do
-            if [[ -n "${HOST_DOMAINS[$i]:-}" ]]; then
+            for ((i=0; i<ACCOUNT_COUNT; i++)); do
               printf '%s\n' "${HOST_DOMAINS[$i]}" >> "${DOMAIN_NEXT}"
-            fi
-          done
+            done
+          else
+            echo "⚠️ 检测到失败项目，本次不更新 domain.txt，避免列表与项目序号错位。"
+            rm -f "${DOMAIN_NEXT}"
+          fi
 
           # ==========================================================
           # 输出与提交
           # ==========================================================
           echo ""
-          echo "================ domain.txt ================"
-          cat "${DOMAIN_NEXT}"
-          echo "============================================="
+          echo "┌────┬─────────────────────────────────────────────────────┐"
+          echo "│ ID │ 最终管理地址                                        │"
+          echo "├────┼─────────────────────────────────────────────────────┤"
+          for ((i=0; i<ACCOUNT_COUNT; i++)); do
+            printf '│ %2d │ %-51s │\n' "$((i + 1))" "${ADMIN_DOMAINS[$i]:-失败/无域名}"
+          done
+          echo "└────┴─────────────────────────────────────────────────────┘"
 
-          if [[ -f domain.txt ]] &&
-             cmp -s "${DOMAIN_NEXT}" domain.txt; then
-            echo "✨ domain.txt 内容无变化，跳过 Commit。"
-            rm -f "${DOMAIN_NEXT}"
-          else
-            mv "${DOMAIN_NEXT}" domain.txt
+          if (( ${#FAILED_PROJECTS[@]} == 0 )); then
+            echo ""
+            echo "================ domain.txt ================"
+            cat "${DOMAIN_NEXT}"
+            echo "============================================="
 
-            git add domain.txt
-            git commit \
-              -m "chore: auto update deployed domains list [skip ci]"
+            if [[ -f domain.txt ]] &&
+               cmp -s "${DOMAIN_NEXT}" domain.txt; then
+              echo "✨ domain.txt 内容无变化，跳过 Commit。"
+              rm -f "${DOMAIN_NEXT}"
+            else
+              mv "${DOMAIN_NEXT}" domain.txt
 
-            git push origin "HEAD:${GITHUB_REF_NAME}"
+              git add domain.txt
+              git commit \
+                -m "chore: auto update deployed domains list [skip ci]"
+              git push origin "HEAD:${GITHUB_REF_NAME}"
 
-            echo "✅ domain.txt 已推送到 GitHub。"
+              echo "✅ domain.txt 已推送到 GitHub。"
+            fi
           fi
 
           if (( ${#FAILED_PROJECTS[@]} > 0 )); then
