@@ -1,5 +1,11 @@
 name: 批量自动部署至 Cloudflare Pages
+
 on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - domain.txt
   schedule:
     # 台湾时间每天 08:00
     - cron: "0 8 * * *"
@@ -7,54 +13,51 @@ on:
     # 台湾时间每天 19:00
     - cron: "0 19 * * *"
       timezone: "Asia/Taipei"
-  # GitHub Actions 页面支持手动运行
   workflow_dispatch:
+
 permissions:
   contents: write
+
 concurrency:
   group: batch-deploy
   cancel-in-progress: false
+
 jobs:
   batch-deploy:
     name: Batch Deploy & Update Domain List
     runs-on: ubuntu-latest
     timeout-minutes: 30
+
     steps:
-      # ============================================================
-      # 1. Checkout
-      # ============================================================
       - name: Checkout Repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      # ============================================================
-      # 2. Node.js
-      # ============================================================
+
       - name: Setup Node.js
         uses: actions/setup-node@v6
         with:
-          node-version: "lts/*"
+          node-version: "24.x"
           check-latest: true
           package-manager-cache: false
-      # ============================================================
-      # 3. 安装最新 Wrangler
-      # ============================================================
+
       - name: Install Latest Wrangler
         shell: bash
         run: |
           set -euo pipefail
+
           WRANGLER_HOME="${RUNNER_TEMP}/wrangler"
           mkdir -p "${WRANGLER_HOME}"
+
           npm install \
             --prefix "${WRANGLER_HOME}" \
             --no-save \
             --no-package-lock \
             wrangler@latest
+
           "${WRANGLER_HOME}/node_modules/.bin/wrangler" --version
-      # ============================================================
-      # 4. 下载 beta2.1 + 批量部署
-      # ============================================================
-      - name: Download beta2.1 and Batch Deploy
+
+      - name: Download EdgeTunnel and Batch Deploy
         shell: bash
         env:
           CF_ACCOUNTS: ${{ secrets.CF_ACCOUNTS }}
@@ -63,102 +66,122 @@ jobs:
           WRANGLER_BIN: ${{ runner.temp }}/wrangler/node_modules/.bin/wrangler
         run: |
           set -euo pipefail
-          # ========================================================
-          # 基础检查
-          # ========================================================
+
+          # ==========================================================
+          # 【可修改配置区】
+          #
+          # 这里只放“项目本身”的固定变量，方便以后修改。
+          # ADMIN 按你的要求使用 plain_text，因此会直接显示在
+          # Cloudflare Pages 项目配置中。
+          # ==========================================================
+          readonly UPSTREAM_REPO="cmliu/edgetunnel"
+          readonly UPSTREAM_BRANCH="beta2.1"
+          readonly DEFAULT_URL="https://cloudflare-error-page-3th.pages.dev"
+
+          readonly PRELOAD_RACE_DIAL="1"
+          readonly TCP_CONCURRENT_DIAL="4"
+          readonly PROXY_CONCURRENT_DIAL="4"
+
+          readonly KV_NAME="kv"
+          readonly PAGES_PRODUCTION_BRANCH="main"
+          readonly API_BASE="https://api.cloudflare.com/client/v4"
+
+          # 运行环境检查
           : "${CF_ACCOUNTS:?❌ 未检测到 CF_ACCOUNTS Secrets 变量}"
           : "${ADMIN_PASS:?❌ 未检测到 ADMIN Secrets 变量}"
+
           if [[ ! -x "${WRANGLER_BIN}" ]]; then
             echo "❌ Wrangler 未正确安装：${WRANGLER_BIN}"
             exit 1
           fi
+
           require_cmd() {
             command -v "$1" >/dev/null 2>&1 || {
               echo "❌ 缺少依赖：$1"
               exit 1
             }
           }
+
           require_cmd curl
           require_cmd jq
           require_cmd unzip
           require_cmd sha256sum
-          # ========================================================
-          # 固定上游
-          # ========================================================
-          readonly API_BASE="https://api.cloudflare.com/client/v4"
-          readonly UPSTREAM_REPO="cmliu/edgetunnel"
-          readonly UPSTREAM_BRANCH="beta2.1"
+          require_cmd git
+
           readonly ZIP_URL="https://github.com/${UPSTREAM_REPO}/archive/refs/heads/${UPSTREAM_BRANCH}.zip"
+
           echo "=================================================="
-          echo "🚀 EdgeTunnel 自动部署"
+          echo "🚀 EdgeTunnel 批量自动部署"
           echo "=================================================="
           echo "📦 上游仓库：${UPSTREAM_REPO}"
           echo "🌿 上游分支：${UPSTREAM_BRANCH}"
           echo "🔗 ZIP：${ZIP_URL}"
+          echo "🌐 URL：${DEFAULT_URL}"
+          echo "⚙️ PRELOAD_RACE_DIAL=${PRELOAD_RACE_DIAL}"
+          echo "⚙️ TCP_CONCURRENT_DIAL=${TCP_CONCURRENT_DIAL}"
+          echo "⚙️ PROXY_CONCURRENT_DIAL=${PROXY_CONCURRENT_DIAL}"
+          echo "📦 KV：${KV_NAME}"
           echo "=================================================="
-          # ========================================================
-          # 临时工作目录
-          # ========================================================
+
+          # ==========================================================
+          # 临时目录与清理
+          # ==========================================================
           WORK_DIR="$(mktemp -d "${RUNNER_TEMP}/edgetunnel-deploy.XXXXXX")"
           trap 'rm -rf "${WORK_DIR}"' EXIT
+
           SOURCE_ZIP="${WORK_DIR}/source.zip"
           SOURCE_DIR="${WORK_DIR}/source"
+          DOMAIN_NEXT="${WORK_DIR}/domain.next.txt"
+
           mkdir -p "${SOURCE_DIR}"
-          # ========================================================
-          # 下载 beta2.1 ZIP
-          # ========================================================
-          echo "⬇️ 正在下载 beta2.1..."
+
+          # ==========================================================
+          # 下载并校验上游代码
+          # ==========================================================
+          echo "⬇️ 正在下载 ${UPSTREAM_BRANCH}..."
+
           curl -fsSL \
             --retry 4 \
             --retry-all-errors \
             --retry-delay 2 \
             -o "${SOURCE_ZIP}" \
             "${ZIP_URL}"
-          # 检查 ZIP 是否损坏
+
           unzip -tq "${SOURCE_ZIP}"
-          # 解压
           unzip -q "${SOURCE_ZIP}" -d "${SOURCE_DIR}"
-          # 获取 ZIP 顶层目录
+
           PAYLOAD_DIR="$(
             find "${SOURCE_DIR}" \
               -mindepth 1 \
               -maxdepth 1 \
-              -type d |
-            head -n 1
+              -type d \
+              -print -quit
           )"
-          if [[ -z "${PAYLOAD_DIR}" ]]; then
+
+          if [[ -z "${PAYLOAD_DIR}" || ! -d "${PAYLOAD_DIR}" ]]; then
             echo "❌ ZIP 结构异常，无法找到项目目录。"
             exit 1
           fi
-          # ========================================================
-          # EdgeTunnel Pages Advanced Mode 必须有 _worker.js
-          # ========================================================
+
           if [[ ! -f "${PAYLOAD_DIR}/_worker.js" ]]; then
-            echo "❌ beta2.1 中没有找到 _worker.js。"
+            echo "❌ ${UPSTREAM_BRANCH} 中没有找到 _worker.js。"
             echo "❌ 为防止部署错误版本，本次任务终止。"
             exit 1
           fi
-          # ========================================================
-          # 清理上游历史 wrangler.toml
-          #
-          # 后面会在每个项目目录中生成本次部署专用配置，
-          # 明确指定 pages_build_output_dir 与 compatibility_date。
-          # ========================================================
-          if [[ -f "${PAYLOAD_DIR}/wrangler.toml" ]]; then
-            echo "🧹 检测到上游历史 wrangler.toml，忽略并删除："
-            echo "   ${PAYLOAD_DIR}/wrangler.toml"
-            rm -f "${PAYLOAD_DIR}/wrangler.toml"
-          fi
-          # ========================================================
-          # 输出上游版本信息
-          # ========================================================
+
+          # 上游配置不直接继承，下面会给每个项目生成一份明确的配置。
+          rm -f "${PAYLOAD_DIR}/wrangler.toml"
+
           SOURCE_SHA="$(
-            sha256sum "${SOURCE_ZIP}" |
-            awk '{print $1}'
+            sha256sum "${SOURCE_ZIP}" | awk '{print $1}'
           )"
-          # Cloudflare 曾出现 Pages 项目配置日期领先 API 当前日期一天；使用 UTC 昨日作为安全日期，避免未来日期拒绝。
-          COMPATIBILITY_DATE="$(date -u -d '1 day ago' +%Y-%m-%d)"
+
+          # 使用 UTC 昨日作为安全兼容日期，避免出现未来日期问题。
+          readonly COMPATIBILITY_DATE="$(date -u -d '1 day ago' +%Y-%m-%d)"
+
           echo "🗓️ Compatibility Date：${COMPATIBILITY_DATE}"
+          echo "🔐 ZIP SHA256：${SOURCE_SHA}"
+
           if UPSTREAM_SHA="$(
             curl -fsSL \
               --retry 3 \
@@ -168,343 +191,370 @@ jobs:
               "https://api.github.com/repos/${UPSTREAM_REPO}/commits/${UPSTREAM_BRANCH}" |
             jq -r '.sha // empty'
           )"; then
-            :
+            echo "🔖 ${UPSTREAM_BRANCH} 当前提交：${UPSTREAM_SHA}"
           else
-            UPSTREAM_SHA=""
+            echo "⚠️ 无法获取 GitHub 当前 commit SHA，继续部署。"
           fi
-          if [[ -n "${UPSTREAM_SHA}" ]]; then
-            echo "🔖 beta2.1 当前提交：${UPSTREAM_SHA}"
-          else
-            echo "⚠️ 无法获取 GitHub 当前 commit SHA。"
-          fi
-          echo "🔐 ZIP SHA256：${SOURCE_SHA}"
-          # ========================================================
-          # Cloudflare 账号数组
-          # ========================================================
+
+          # ==========================================================
+          # 解析 CF_ACCOUNTS
+          #
+          # 支持：
+          #   ACCOUNT_ID:API_TOKEN
+          #   ACCOUNT_ID:GLOBAL_API_KEY:EMAIL
+          #
+          # 两种格式混合使用也可以，一行一个账号。
+          # ==========================================================
           declare -a ACCOUNT_IDS=()
           declare -a CREDENTIALS=()
           declare -a AUTH_TYPES=()
           declare -a AUTH_EMAILS=()
-          # ========================================================
-          # 解析 CF_ACCOUNTS
-          #
-          # 普通 API Token：
-          #
-          # ACCOUNT_ID:API_TOKEN
-          #
-          # Global API Key：
-          #
-          # ACCOUNT_ID:GLOBAL_API_KEY:EMAIL
-          #
-          # 注意：
-          # 这里不再根据 cfk_ 前缀猜测认证类型。
-          #
-          # 两段 = API Token
-          # 三段 = Global API Key + Email
-          #
-          # 这样才可靠。
-          # ========================================================
+
+          trim() {
+            local value="$1"
+            value="${value#"${value%%[![:space:]]*}"}"
+            value="${value%"${value##*[![:space:]]}"}"
+            printf '%s' "${value}"
+          }
+
           while IFS= read -r raw_line || [[ -n "${raw_line}" ]]; do
-            line="${raw_line#"${raw_line%%[![:space:]]*}"}"
-            line="${line%"${line##*[![:space:]]}"}"
+            line="$(trim "${raw_line}")"
+
             [[ -z "${line}" ]] && continue
             [[ "${line}" =~ ^# ]] && continue
-            IFS=':' read -r -a PARTS <<< "${line}"
-            # --------------------------------------------------------
-            # API Token
-            # --------------------------------------------------------
-            if (( ${#PARTS[@]} == 2 )); then
-              ACCOUNT_ID="${PARTS[0]}"
-              CREDENTIAL="${PARTS[1]}"
-              EMAIL=""
-              AUTH_TYPE="api_token"
-            # --------------------------------------------------------
-            # Global API Key
-            # --------------------------------------------------------
-            elif (( ${#PARTS[@]} == 3 )); then
-              ACCOUNT_ID="${PARTS[0]}"
-              CREDENTIAL="${PARTS[1]}"
-              EMAIL="${PARTS[2]}"
-              AUTH_TYPE="global_key"
+
+            account_id=""
+            credential=""
+            email=""
+            extra=""
+            IFS=':' read -r account_id credential email extra <<< "${line}"
+
+            account_id="$(trim "${account_id}")"
+            credential="$(trim "${credential}")"
+            email="$(trim "${email}")"
+            extra="$(trim "${extra}")"
+
+            if [[ -n "${extra}" ]]; then
+              echo "❌ CF_ACCOUNTS 格式错误：${line}"
+              echo "   支持：ACCOUNT_ID:API_TOKEN"
+              echo "   或：ACCOUNT_ID:GLOBAL_API_KEY:EMAIL"
+              exit 1
+            fi
+
+            if [[ -z "${email}" ]]; then
+              auth_type="api_token"
             else
-              echo "❌ CF_ACCOUNTS 格式错误："
-              echo ""
-              echo "普通 API Token："
-              echo "ACCOUNT_ID:API_TOKEN"
-              echo ""
-              echo "Global API Key："
-              echo "ACCOUNT_ID:GLOBAL_API_KEY:EMAIL"
-              echo ""
+              auth_type="global_key"
+            fi
+
+            if [[ ! "${account_id}" =~ ^[A-Fa-f0-9]{32}$ ]]; then
+              echo "❌ 无效 Account ID：${account_id}"
               exit 1
             fi
-            # --------------------------------------------------------
-            # 清理空白
-            # --------------------------------------------------------
-            ACCOUNT_ID="${ACCOUNT_ID#"${ACCOUNT_ID%%[![:space:]]*}"}"
-            ACCOUNT_ID="${ACCOUNT_ID%"${ACCOUNT_ID##*[![:space:]]}"}"
-            CREDENTIAL="${CREDENTIAL#"${CREDENTIAL%%[![:space:]]*}"}"
-            CREDENTIAL="${CREDENTIAL%"${CREDENTIAL##*[![:space:]]}"}"
-            EMAIL="${EMAIL#"${EMAIL%%[![:space:]]*}"}"
-            EMAIL="${EMAIL%"${EMAIL##*[![:space:]]}"}"
-            # --------------------------------------------------------
-            # 校验 Account ID
-            # --------------------------------------------------------
-            if [[ ! "${ACCOUNT_ID}" =~ ^[A-Fa-f0-9]{32}$ ]]; then
-              echo "❌ 无效 Account ID：${ACCOUNT_ID}"
+
+            if [[ -z "${credential}" ]]; then
+              echo "❌ Account ${account_id} 的凭证为空。"
               exit 1
             fi
-            if [[ -z "${CREDENTIAL}" ]]; then
-              echo "❌ Account ${ACCOUNT_ID} 的凭证为空。"
+
+            if [[ "${auth_type}" == "global_key" &&
+                  ! "${email}" =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]]; then
+              echo "❌ Account ${account_id} 的 Global API Key 邮箱格式无效。"
               exit 1
             fi
-            # --------------------------------------------------------
-            # Global API Key Email
-            # --------------------------------------------------------
-            if [[ "${AUTH_TYPE}" == "global_key" ]]; then
-              if [[ "${EMAIL}" != *@*.* ]]; then
-                echo "❌ Account ${ACCOUNT_ID} 的 Global API Key 邮箱格式无效。"
-                exit 1
-              fi
-            fi
-            ACCOUNT_IDS+=("${ACCOUNT_ID}")
-            CREDENTIALS+=("${CREDENTIAL}")
-            AUTH_TYPES+=("${AUTH_TYPE}")
-            AUTH_EMAILS+=("${EMAIL}")
+
+            ACCOUNT_IDS+=("${account_id}")
+            CREDENTIALS+=("${credential}")
+            AUTH_TYPES+=("${auth_type}")
+            AUTH_EMAILS+=("${email}")
           done <<< "${CF_ACCOUNTS}"
-          ACCOUNT_COUNT="${#ACCOUNT_IDS[@]}"
+
+          readonly ACCOUNT_COUNT="${#ACCOUNT_IDS[@]}"
+
           if (( ACCOUNT_COUNT == 0 )); then
             echo "❌ CF_ACCOUNTS 没有有效账号。"
             exit 1
           fi
+
           echo "📦 共检测到 ${ACCOUNT_COUNT} 个 Cloudflare 账号。"
-          # ========================================================
-          # UUID 配置
+
+          # ==========================================================
+          # UUID 聚合
           #
-          # 格式：
+          # UUID Secret 格式：
+          #   项目序号:UUIDv4
           #
-          # 1:xxxxxxxx-xxxx-4xxx-8xxx-xxxxxxxxxxxx
+          # 例如：
+          #   1:xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx
           #
-          # 第 1 个项目作为 UUID 来源项目。
-          # 第 1 个项目不写 UUID。
-          # 其他项目复用这个 UUID。
-          #
-          # 没配置 UUID：
-          # 不主动修改 UUID。
-          # ========================================================
+          # 含义：第 N 个项目作为 UUID 来源，其他项目统一使用该 UUID。
+          # 为兼容现有工作方式，不主动改写“来源项目”本身。
+          # ==========================================================
           UUID_TARGET_INDEX=""
           UUID_VALUE=""
           UUID_VALID=false
+
           if [[ -n "${UUID_CONFIG:-}" ]]; then
-            if [[ "${UUID_CONFIG}" =~ ^([0-9]+):([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12})$ ]]; then
+            if [[ "${UUID_CONFIG}" =~ ^([0-9]+):([[:xdigit:]]{8}-[[:xdigit:]]{4}-4[[:xdigit:]]{3}-[89abAB][[:xdigit:]]{3}-[[:xdigit:]]{12})$ ]]; then
               UUID_TARGET_INDEX="${BASH_REMATCH[1]}"
               UUID_VALUE="${BASH_REMATCH[2]}"
+
               if (( UUID_TARGET_INDEX >= 1 &&
                     UUID_TARGET_INDEX <= ACCOUNT_COUNT )); then
                 UUID_VALID=true
-                echo "🧩 UUID 聚合："
-                echo "   来源项目：${UUID_TARGET_INDEX}"
-                echo "   其他项目复用该 UUID"
+                echo "🧩 UUID 聚合：来源项目=${UUID_TARGET_INDEX}"
+                echo "   其他项目统一使用同一个 UUID。"
               else
-                echo "⚠️ UUID 项目序号 ${UUID_TARGET_INDEX} 超出账号数量。"
-                echo "⚠️ 本次不使用 UUID 聚合。"
+                echo "⚠️ UUID 项目序号 ${UUID_TARGET_INDEX} 超出当前账号数量。"
+                echo "⚠️ 本次跳过 UUID 聚合。"
               fi
             else
-              echo "⚠️ UUID 配置格式无效。"
-              echo "⚠️ 本次不使用 UUID 聚合。"
+              echo "⚠️ UUID 配置格式无效：${UUID_CONFIG}"
+              echo "⚠️ 正确格式：项目序号:UUIDv4"
+              echo "⚠️ 本次跳过 UUID 聚合。"
             fi
           else
             echo "ℹ️ 未配置 UUID 聚合。"
           fi
-          # ========================================================
-          # Cloudflare API GET
-          # ========================================================
+
+          # ==========================================================
+          # Cloudflare API 统一请求函数
+          # ==========================================================
+          api_request() {
+            local index="$1"
+            local method="$2"
+            local url="$3"
+            local data="${4:-}"
+
+            local -a headers=(
+              "-H" "Content-Type: application/json"
+            )
+
+            if [[ "${AUTH_TYPES[$index]}" == "global_key" ]]; then
+              headers+=(
+                "-H" "X-Auth-Email: ${AUTH_EMAILS[$index]}"
+                "-H" "X-Auth-Key: ${CREDENTIALS[$index]}"
+              )
+            else
+              headers+=(
+                "-H" "Authorization: Bearer ${CREDENTIALS[$index]}"
+              )
+            fi
+
+            if [[ "${method}" == "GET" ]]; then
+              curl -fsSL \
+                --retry 4 \
+                --retry-all-errors \
+                --retry-delay 2 \
+                "${headers[@]}" \
+                "${url}"
+              return
+            fi
+
+            if [[ -n "${data}" ]]; then
+              curl -sS \
+                --retry 4 \
+                --retry-all-errors \
+                --retry-delay 2 \
+                -X "${method}" \
+                "${headers[@]}" \
+                --data "${data}" \
+                "${url}"
+            else
+              curl -sS \
+                --retry 4 \
+                --retry-all-errors \
+                --retry-delay 2 \
+                -X "${method}" \
+                "${headers[@]}" \
+                "${url}"
+            fi
+          }
+
           api_get() {
-            local index="$1"
-            local url="$2"
-            if [[ "${AUTH_TYPES[$index]}" == "global_key" ]]; then
-              curl -fsSL \
-                --retry 4 \
-                --retry-all-errors \
-                --retry-delay 2 \
-                -H "X-Auth-Email: ${AUTH_EMAILS[$index]}" \
-                -H "X-Auth-Key: ${CREDENTIALS[$index]}" \
-                -H "Content-Type: application/json" \
-                "${url}"
-            else
-              curl -fsSL \
-                --retry 4 \
-                --retry-all-errors \
-                --retry-delay 2 \
-                -H "Authorization: Bearer ${CREDENTIALS[$index]}" \
-                -H "Content-Type: application/json" \
-                "${url}"
-            fi
+            api_request "$1" GET "$2"
           }
-          # ========================================================
-          # Cloudflare API POST
-          # ========================================================
+
           api_post() {
-            local index="$1"
-            local url="$2"
-            local data="$3"
-            if [[ "${AUTH_TYPES[$index]}" == "global_key" ]]; then
-              curl -sS \
-                --retry 4 \
-                --retry-all-errors \
-                --retry-delay 2 \
-                -X POST \
-                -H "X-Auth-Email: ${AUTH_EMAILS[$index]}" \
-                -H "X-Auth-Key: ${CREDENTIALS[$index]}" \
-                -H "Content-Type: application/json" \
-                --data "${data}" \
-                "${url}"
-            else
-              curl -sS \
-                --retry 4 \
-                --retry-all-errors \
-                --retry-delay 2 \
-                -X POST \
-                -H "Authorization: Bearer ${CREDENTIALS[$index]}" \
-                -H "Content-Type: application/json" \
-                --data "${data}" \
-                "${url}"
-            fi
+            api_request "$1" POST "$2" "$3"
           }
-          # ========================================================
-          # Cloudflare API PATCH
-          # ========================================================
+
           api_patch() {
-            local index="$1"
-            local url="$2"
-            local data="$3"
-            if [[ "${AUTH_TYPES[$index]}" == "global_key" ]]; then
-              curl -sS \
-                --retry 4 \
-                --retry-all-errors \
-                --retry-delay 2 \
-                -X PATCH \
-                -H "X-Auth-Email: ${AUTH_EMAILS[$index]}" \
-                -H "X-Auth-Key: ${CREDENTIALS[$index]}" \
-                -H "Content-Type: application/json" \
-                --data "${data}" \
-                "${url}"
-            else
-              curl -sS \
-                --retry 4 \
-                --retry-all-errors \
-                --retry-delay 2 \
-                -X PATCH \
-                -H "Authorization: Bearer ${CREDENTIALS[$index]}" \
-                -H "Content-Type: application/json" \
-                --data "${data}" \
-                "${url}"
-            fi
+            api_request "$1" PATCH "$2" "$3"
           }
-          # ========================================================
-          # Wrangler 部署认证
-          #
-          # Cloudflare API 的 curl 请求可以直接按当前账号使用
-          # CF_ACCOUNTS 中的凭证，但 Wrangler 是独立进程，
-          # 不会自动读取这些数组。
-          #
-          # API Token：
-          #   CLOUDFLARE_ACCOUNT_ID
-          #   CLOUDFLARE_API_TOKEN
-          #
-          # Global API Key：
-          #   CLOUDFLARE_ACCOUNT_ID
-          #   CLOUDFLARE_API_KEY
-          #   CLOUDFLARE_EMAIL
-          #
-          # 每次部署前都显式覆盖，并清理另一种认证变量，
-          # 防止不同账号之间发生认证串号。
-          # ========================================================
+
+          # ==========================================================
+          # Pages 部署
+          # ==========================================================
           run_pages_deploy() {
             local index="$1"
             local account_id="${ACCOUNT_IDS[$index]}"
             local project_name="$((index + 1))"
-            echo "🔐 正在准备 Wrangler 认证：项目 ${project_name}"
+
             if [[ "${AUTH_TYPES[$index]}" == "api_token" ]]; then
-              env                 -u CLOUDFLARE_API_KEY                 -u CLOUDFLARE_EMAIL                 CLOUDFLARE_ACCOUNT_ID="${account_id}"                 CLOUDFLARE_API_TOKEN="${CREDENTIALS[$index]}"                 "${WRANGLER_BIN}" pages deploy .                   --project-name="${project_name}"                   --branch=main                   --commit-dirty=true
+              env \
+                -u CLOUDFLARE_API_KEY \
+                -u CLOUDFLARE_EMAIL \
+                CLOUDFLARE_ACCOUNT_ID="${account_id}" \
+                CLOUDFLARE_API_TOKEN="${CREDENTIALS[$index]}" \
+                "${WRANGLER_BIN}" pages deploy . \
+                  --project-name="${project_name}" \
+                  --branch="${PAGES_PRODUCTION_BRANCH}" \
+                  --commit-dirty=true
             else
-              env                 -u CLOUDFLARE_API_TOKEN                 CLOUDFLARE_ACCOUNT_ID="${account_id}"                 CLOUDFLARE_API_KEY="${CREDENTIALS[$index]}"                 CLOUDFLARE_EMAIL="${AUTH_EMAILS[$index]}"                 "${WRANGLER_BIN}" pages deploy .                   --project-name="${project_name}"                   --branch=main                   --commit-dirty=true
+              env \
+                -u CLOUDFLARE_API_TOKEN \
+                CLOUDFLARE_ACCOUNT_ID="${account_id}" \
+                CLOUDFLARE_API_KEY="${CREDENTIALS[$index]}" \
+                CLOUDFLARE_EMAIL="${AUTH_EMAILS[$index]}" \
+                "${WRANGLER_BIN}" pages deploy . \
+                  --project-name="${project_name}" \
+                  --branch="${PAGES_PRODUCTION_BRANCH}" \
+                  --commit-dirty=true
             fi
           }
-          # ========================================================
-          # 部署结果
-          # ========================================================
+
+          # ==========================================================
+          # 获取 Pages 自定义域
+          #
+          # 优先：active 的非 pages.dev 域名
+          # 其次：已绑定但尚未 active 的非 pages.dev 域名
+          # 最后：Pages 原生 subdomain
+          #
+          # 这样用户后续手动绑定自定义域后，不需要再改 Secret。
+          # ==========================================================
+          get_preferred_domain() {
+            local index="$1"
+            local project_name="$2"
+            local project_json="$3"
+            local domains_json=""
+            local custom_domain=""
+            local pages_subdomain=""
+
+            pages_subdomain="$(
+              jq -r '.result.subdomain // empty' <<< "${project_json}"
+            )"
+
+            if domains_json="$(
+              api_get \
+                "${index}" \
+                "${API_BASE}/accounts/${ACCOUNT_IDS[$index]}/pages/projects/${project_name}/domains"
+            )"; then
+              custom_domain="$(
+                jq -r '
+                  [
+                    .result[]?
+                    | select(
+                        (.name // "") != ""
+                        and ((.name | ascii_downcase) | endswith(".pages.dev") | not)
+                      )
+                  ]
+                  | sort_by(
+                      if .status == "active" then 0
+                      elif .status == "pending" then 1
+                      else 2
+                      end
+                    )
+                  | .[0].name // empty
+                ' <<< "${domains_json}"
+              )"
+            else
+              echo "⚠️ 无法读取 Pages 自定义域列表，将使用 pages.dev。" >&2
+            fi
+
+            if [[ -n "${custom_domain}" ]]; then
+              printf '%s\n' "${custom_domain}"
+              return 0
+            fi
+
+            printf '%s\n' "${pages_subdomain}"
+          }
+
+          # ==========================================================
+          # 结果数组
+          # ==========================================================
           declare -a ADMIN_DOMAINS=()
           declare -a HOST_DOMAINS=()
           declare -a FAILED_PROJECTS=()
+
           DEPLOYED_COUNT=0
-          # ========================================================
-          # 单个账号
-          # ========================================================
+
+          # ==========================================================
+          # 部署单个账号
+          # ==========================================================
           deploy_one() {
             local index="$1"
             local account_id="${ACCOUNT_IDS[$index]}"
             local project_name="$((index + 1))"
-            local kv_name="kv"
-            local project_resp
-            local create_resp
-            local kv_list
-            local kv_id
-            local config_patch
-            local subdomain
-            local final_url
+
+            local project_resp=""
+            local create_resp=""
+            local kv_list=""
+            local kv_id=""
+            local config_patch=""
+            local config_patch_resp=""
+            local host=""
+            local final_url=""
+
             echo ""
             echo "=================================================="
-            echo "🚀 正在处理第 ${project_name} 个账号"
+            echo "🚀 第 ${project_name} 个账号"
             echo "   Account ID: ${account_id}"
             echo "   Pages 项目: ${project_name}"
             echo "=================================================="
-            # ======================================================
-            # 1. 查询 Pages 项目
-            # ======================================================
+
+            # ----------------------------------------------------------
+            # 1. 检查/创建 Pages 项目
+            # ----------------------------------------------------------
             if project_resp="$(
               api_get \
                 "${index}" \
                 "${API_BASE}/accounts/${account_id}/pages/projects/${project_name}"
             )"; then
-              if echo "${project_resp}" |
-                jq -e '.success == true and (.result.name // "") != ""' >/dev/null; then
-                echo "✅ Pages 项目已存在：${project_name}"
+              if jq -e '.success == true and (.result.name // "") != ""' \
+                >/dev/null <<< "${project_resp}"; then
+                echo "✅ Pages 项目已存在。"
               else
                 project_resp=""
               fi
             else
               project_resp=""
             fi
-            # ======================================================
-            # 2. Pages 项目不存在则创建
-            # ======================================================
+
             if [[ -z "${project_resp}" ]]; then
-              echo "📁 未检测到 Pages 项目 ${project_name}，正在创建..."
+              echo "📁 Pages 项目不存在，正在创建..."
+
               create_resp="$(
                 api_post \
                   "${index}" \
                   "${API_BASE}/accounts/${account_id}/pages/projects" \
                   "$(jq -nc \
                     --arg name "${project_name}" \
+                    --arg branch "${PAGES_PRODUCTION_BRANCH}" \
                     '{
                       name: $name,
-                      production_branch: "main"
+                      production_branch: $branch
                     }')"
               )"
-              if ! echo "${create_resp}" |
-                jq -e '.success == true and (.result.name // "") != ""' >/dev/null; then
+
+              if ! jq -e \
+                '.success == true and (.result.name // "") != ""' \
+                >/dev/null <<< "${create_resp}"; then
                 echo "❌ 创建 Pages 项目失败："
-                echo "${create_resp}" |
-                  jq -c '{success,errors,messages}' 2>/dev/null || true
+                jq -c '{success,errors,messages}' \
+                  <<< "${create_resp}" 2>/dev/null || true
                 return 1
               fi
+
               project_resp="${create_resp}"
-              echo "✅ Pages 项目创建成功：${project_name}"
+              echo "✅ Pages 项目创建成功。"
             fi
-            # ======================================================
-            # 3. 查询 KV
-            # ======================================================
-            echo "📦 检查 KV：${kv_name}"
+
+            # ----------------------------------------------------------
+            # 2. 检查/创建 KV
+            # ----------------------------------------------------------
+            echo "📦 检查 KV：${KV_NAME}"
+
             if ! kv_list="$(
               api_get \
                 "${index}" \
@@ -513,113 +563,153 @@ jobs:
               echo "❌ 无法读取 KV 列表。"
               return 1
             fi
-            if ! echo "${kv_list}" |
-              jq -e '.success == true and (.result | type == "array")' >/dev/null; then
-              echo "❌ KV API 返回异常。"
-              echo "${kv_list}" |
-                jq -c '{success,errors,messages}' 2>/dev/null || true
+
+            if ! jq -e \
+              '.success == true and (.result | type == "array")' \
+              >/dev/null <<< "${kv_list}"; then
+              echo "❌ KV API 返回异常："
+              jq -c '{success,errors,messages}' \
+                <<< "${kv_list}" 2>/dev/null || true
               return 1
             fi
+
             kv_id="$(
-              echo "${kv_list}" |
               jq -r \
-                --arg title "${kv_name}" \
+                --arg title "${KV_NAME}" \
                 '.result[]
                  | select(.title == $title)
-                 | .id' |
+                 | .id' \
+                <<< "${kv_list}" |
               head -n 1
             )"
-            # ======================================================
-            # 4. 没有 KV 就创建
-            # ======================================================
-            if [[ -z "${kv_id}" ||
-                  "${kv_id}" == "null" ]]; then
-              echo "📦 没有找到 '${kv_name}'，正在创建..."
+
+            if [[ -z "${kv_id}" || "${kv_id}" == "null" ]]; then
+              echo "📦 未找到 '${KV_NAME}'，正在创建..."
+
               create_resp="$(
                 api_post \
                   "${index}" \
                   "${API_BASE}/accounts/${account_id}/storage/kv/namespaces" \
                   "$(jq -nc \
-                    --arg title "${kv_name}" \
+                    --arg title "${KV_NAME}" \
                     '{title:$title}')"
               )"
-              if ! echo "${create_resp}" |
-                jq -e '.success == true and (.result.id // "") != ""' >/dev/null; then
+
+              if ! jq -e \
+                '.success == true and (.result.id // "") != ""' \
+                >/dev/null <<< "${create_resp}"; then
                 echo "❌ 创建 KV 失败："
-                echo "${create_resp}" |
-                  jq -c '{success,errors,messages}' 2>/dev/null || true
+                jq -c '{success,errors,messages}' \
+                  <<< "${create_resp}" 2>/dev/null || true
                 return 1
               fi
-              kv_id="$(
-                echo "${create_resp}" |
-                jq -r '.result.id'
-              )"
-              echo "✅ KV 创建成功。"
+
+              kv_id="$(jq -r '.result.id' <<< "${create_resp}")"
+              echo "✅ KV 创建成功：${kv_id}"
             else
               echo "✅ 已存在 KV：${kv_id}"
             fi
-            # ======================================================
-            # 5. 配置 Pages 环境变量和 KV
-            #
-            # 这里完全使用 Cloudflare Pages API。
-            #
-            # 不再通过 Pages 项目 API 写入 Compatibility Date。
-            #
-            # ADMIN 使用 secret_text。
-            # 其他变量使用 plain_text。
-            #
-            # KV 绑定：
-            # KV -> 当前账号的 kv namespace。
-            # ======================================================
-            echo "⚙️ 正在配置 Pages 变量和 KV 绑定..."
-            config_patch="$(jq -nc --arg admin "${ADMIN_PASS}" --arg url "https://cloudflare-error-page-3th.pages.dev" --arg preload "1" --arg tcp "4" --arg proxy "4" --arg kv_id "${kv_id}" '{deployment_configs:{production:{env_vars:{ADMIN:{type:"secret_text",value:$admin},URL:{type:"plain_text",value:$url},PRELOAD_RACE_DIAL:{type:"plain_text",value:$preload},TCP_CONCURRENT_DIAL:{type:"plain_text",value:$tcp},PROXY_CONCURRENT_DIAL:{type:"plain_text",value:$proxy}},kv_namespaces:{KV:{namespace_id:$kv_id}}}}}')"
-            if [[ "${UUID_VALID}" == true && "${project_name}" != "${UUID_TARGET_INDEX}" ]]; then
-              config_patch="$(jq --arg uuid "${UUID_VALUE}" '.deployment_configs.production.env_vars.UUID={type:"plain_text",value:$uuid}' <<<"${config_patch}")"
+
+            # ----------------------------------------------------------
+            # 3. 配置 Pages 生产环境变量 + KV
+            # ----------------------------------------------------------
+            config_patch="$(
+              jq -nc \
+                --arg admin "${ADMIN_PASS}" \
+                --arg url "${DEFAULT_URL}" \
+                --arg preload "${PRELOAD_RACE_DIAL}" \
+                --arg tcp "${TCP_CONCURRENT_DIAL}" \
+                --arg proxy "${PROXY_CONCURRENT_DIAL}" \
+                --arg kv_id "${kv_id}" \
+                '{
+                  deployment_configs: {
+                    production: {
+                      env_vars: {
+                        ADMIN: {
+                          type: "plain_text",
+                          value: $admin
+                        },
+                        URL: {
+                          type: "plain_text",
+                          value: $url
+                        },
+                        PRELOAD_RACE_DIAL: {
+                          type: "plain_text",
+                          value: $preload
+                        },
+                        TCP_CONCURRENT_DIAL: {
+                          type: "plain_text",
+                          value: $tcp
+                        },
+                        PROXY_CONCURRENT_DIAL: {
+                          type: "plain_text",
+                          value: $proxy
+                        }
+                      },
+                      kv_namespaces: {
+                        KV: {
+                          namespace_id: $kv_id
+                        }
+                      }
+                    }
+                  }
+                }'
+            )"
+
+            if [[ "${UUID_VALID}" == true &&
+                  "${project_name}" != "${UUID_TARGET_INDEX}" ]]; then
+              config_patch="$(
+                jq \
+                  --arg uuid "${UUID_VALUE}" \
+                  '.deployment_configs.production.env_vars.UUID = {
+                     type: "plain_text",
+                     value: $uuid
+                   }' \
+                  <<< "${config_patch}"
+              )"
             fi
+
             config_patch_resp="$(
               api_patch \
                 "${index}" \
                 "${API_BASE}/accounts/${account_id}/pages/projects/${project_name}" \
                 "${config_patch}"
             )"
-            if ! echo "${config_patch_resp}" | jq -e '.success == true' >/dev/null; then
+
+            if ! jq -e '.success == true' \
+              >/dev/null <<< "${config_patch_resp}"; then
               echo "❌ Pages 变量/KV 配置失败："
-              echo "${config_patch_resp}" | jq -c '{success,errors,messages}' 2>/dev/null || true
+              jq -c '{success,errors,messages}' \
+                <<< "${config_patch_resp}" 2>/dev/null || true
               return 1
             fi
-            echo "✅ Pages 变量与 KV 配置完成。Compatibility Date 将由 Wrangler 配置文件控制。"
-            # ======================================================
-            # 5.1 生成本次部署专用 wrangler.toml
-            #
-            # Pages Direct Upload 的 compatibility_date 由 Wrangler 配置文件读取。
-            # 不再依赖 Pages 项目 API 的 compatibility_date 回写。
-            # ======================================================
-            cat > "${PAYLOAD_DIR}/wrangler.toml" <<EOF
-            name = "${project_name}"
-            pages_build_output_dir = "."
-            compatibility_date = "${COMPATIBILITY_DATE}"
 
-            [[kv_namespaces]]
-            binding = "KV"
-            id = "${kv_id}"
+            echo "✅ Pages 生产环境变量与 KV 配置完成。"
+
+            # ----------------------------------------------------------
+            # 4. 生成项目专用 Wrangler 配置
+            # ----------------------------------------------------------
+            cat > "${PAYLOAD_DIR}/wrangler.toml" <<EOF
+          name = "${project_name}"
+          pages_build_output_dir = "."
+          compatibility_date = "${COMPATIBILITY_DATE}"
+
+          [[kv_namespaces]]
+          binding = "KV"
+          id = "${kv_id}"
           EOF
-            echo "🧩 临时 Wrangler 配置："
-            cat "${PAYLOAD_DIR}/wrangler.toml"
-            # ======================================================
-            # 6. 直接部署 beta2.1 ZIP
-            #
-            # 使用当前目录中的临时 wrangler.toml。
-            # 不使用额外 --config 参数。
-            #
-            # 当前目录就是 ZIP 解压后的项目目录。
-            # ======================================================
-            echo "🌐 正在直接部署 beta2.1 项目文件..."
+
+            # ----------------------------------------------------------
+            # 5. 部署，失败时只重试一次
+            # ----------------------------------------------------------
+            echo "🌐 正在部署 Pages 项目 ${project_name}..."
+
             if ! (
               cd "${PAYLOAD_DIR}"
               run_pages_deploy "${index}"
             ); then
-              echo "⚠️ 第 ${project_name} 个项目首次部署失败。"
-              echo "🔁 正在重试一次..."
+              echo "⚠️ 第 ${project_name} 个项目首次部署失败，重试一次..."
+
               if ! (
                 cd "${PAYLOAD_DIR}"
                 run_pages_deploy "${index}"
@@ -628,137 +718,197 @@ jobs:
                 return 1
               fi
             fi
-            # ======================================================
-            # 6.1 验证生产环境 KV 绑定是否真正落地
-            #
-            # 教程要求 Pages 的绑定变量名固定为大写 KV。
-            # Wrangler 配置也明确声明同一个 KV namespace，部署后再次读取
-            # Pages 项目配置，确保控制台/API 中实际存在 KV 绑定。
-            # ======================================================
-            project_resp="$(api_get "${index}" "${API_BASE}/accounts/${account_id}/pages/projects/${project_name}")"
-            if ! echo "${project_resp}" |
-              jq -e --arg kv_id "${kv_id}" \
-                '.success == true
-                 and (.result.deployment_configs.production.kv_namespaces.KV.namespace_id // "") == $kv_id' >/dev/null; then
-              echo "⚠️ KV 绑定验证失败，正在重新写入 Pages KV 绑定并重试部署..."
+
+            # ----------------------------------------------------------
+            # 6. 重新读取项目，验证 KV，避免“命令成功但绑定没落地”
+            # ----------------------------------------------------------
+            project_resp="$(
+              api_get \
+                "${index}" \
+                "${API_BASE}/accounts/${account_id}/pages/projects/${project_name}"
+            )" || {
+              echo "❌ 部署成功后无法读取 Pages 项目。"
+              return 1
+            }
+
+            if ! jq -e \
+              --arg kv_id "${kv_id}" \
+              '.success == true
+               and (
+                 .result.deployment_configs.production.kv_namespaces.KV.namespace_id
+                 // ""
+               ) == $kv_id' \
+              >/dev/null <<< "${project_resp}"; then
+              echo "⚠️ KV 绑定未验证通过，正在补写并重新部署..."
+
               config_patch_resp="$(
                 api_patch \
                   "${index}" \
                   "${API_BASE}/accounts/${account_id}/pages/projects/${project_name}" \
-                  "$(jq -nc --arg kv_id "${kv_id}" '{deployment_configs:{production:{kv_namespaces:{KV:{namespace_id:$kv_id}}}}}')"
+                  "$(jq -nc \
+                    --arg kv_id "${kv_id}" \
+                    '{
+                      deployment_configs: {
+                        production: {
+                          kv_namespaces: {
+                            KV: {
+                              namespace_id: $kv_id
+                            }
+                          }
+                        }
+                      }
+                    }')"
               )"
-              if ! echo "${config_patch_resp}" | jq -e '.success == true' >/dev/null; then
-                echo "❌ 重写 Pages KV 绑定失败："
-                echo "${config_patch_resp}" | jq -c '{success,errors,messages}' 2>/dev/null || true
+
+              if ! jq -e '.success == true' \
+                >/dev/null <<< "${config_patch_resp}"; then
+                echo "❌ 重写 KV 绑定失败："
+                jq -c '{success,errors,messages}' \
+                  <<< "${config_patch_resp}" 2>/dev/null || true
                 return 1
               fi
+
               if ! (
                 cd "${PAYLOAD_DIR}"
                 run_pages_deploy "${index}"
               ); then
-                echo "❌ KV 绑定重试部署失败。"
+                echo "❌ KV 绑定修复后的重新部署失败。"
                 return 1
               fi
-              project_resp="$(api_get "${index}" "${API_BASE}/accounts/${account_id}/pages/projects/${project_name}")"
-              if ! echo "${project_resp}" |
-                jq -e --arg kv_id "${kv_id}" \
-                  '.success == true
-                   and (.result.deployment_configs.production.kv_namespaces.KV.namespace_id // "") == $kv_id' >/dev/null; then
+
+              project_resp="$(
+                api_get \
+                  "${index}" \
+                  "${API_BASE}/accounts/${account_id}/pages/projects/${project_name}"
+              )"
+
+              if ! jq -e \
+                --arg kv_id "${kv_id}" \
+                '.success == true
+                 and (
+                   .result.deployment_configs.production.kv_namespaces.KV.namespace_id
+                   // ""
+                 ) == $kv_id' \
+                >/dev/null <<< "${project_resp}"; then
                 echo "❌ KV 绑定验证仍然失败：binding=KV"
                 return 1
               fi
             fi
+
             echo "✅ KV 绑定验证通过：KV -> ${kv_id}"
-            # ======================================================
-            # 7. 获取真实 Pages subdomain
-            # ======================================================
-            subdomain=""
+
+            # ----------------------------------------------------------
+            # 7. 获取“自定义域优先，否则 pages.dev”的最终域名
+            # ----------------------------------------------------------
+            host=""
+
             for attempt in 1 2 3 4 5; do
-              if project_resp="$(
-                api_get \
+              if host="$(
+                get_preferred_domain \
                   "${index}" \
-                  "${API_BASE}/accounts/${account_id}/pages/projects/${project_name}"
+                  "${project_name}" \
+                  "${project_resp}"
               )"; then
-                subdomain="$(
-                  echo "${project_resp}" |
-                  jq -r '.result.subdomain // empty'
-                )"
-                if [[ -n "${subdomain}" ]]; then
+                host="$(trim "${host}")"
+                if [[ -n "${host}" ]]; then
                   break
                 fi
               fi
-              echo "⏳ 获取 Pages 域名第 ${attempt}/5 次失败，等待 2 秒..."
+
+              echo "⏳ 获取最终域名第 ${attempt}/5 次失败，等待 2 秒..."
               sleep 2
+
+              project_resp="$(
+                api_get \
+                  "${index}" \
+                  "${API_BASE}/accounts/${account_id}/pages/projects/${project_name}"
+              )" || true
             done
-            if [[ -z "${subdomain}" ]]; then
-              echo "❌ 部署成功，但没有获取到 Pages subdomain。"
+
+            if [[ -z "${host}" ]]; then
+              echo "❌ 部署成功，但没有获取到可用域名。"
               return 1
             fi
-            # ======================================================
-            # 8. 清理域名
-            # ======================================================
-            subdomain="${subdomain#https://}"
-            subdomain="${subdomain#http://}"
-            subdomain="${subdomain%/}"
-            final_url="https://${subdomain}/admin"
+
+            host="${host#https://}"
+            host="${host#http://}"
+            host="${host%%/*}"
+            host="${host%.}"
+
+            if [[ -z "${host}" ]]; then
+              echo "❌ 域名清理后为空。"
+              return 1
+            fi
+
+            final_url="https://${host}/admin"
+
             echo "🔗 管理地址：${final_url}"
-            echo "🌐 Host：${subdomain}"
+            echo "🌐 Host：${host}"
+
             ADMIN_DOMAINS[$index]="${final_url}"
-            HOST_DOMAINS[$index]="${subdomain}"
+            HOST_DOMAINS[$index]="${host}"
+
             DEPLOYED_COUNT=$((DEPLOYED_COUNT + 1))
+
             echo "🎉 第 ${project_name} 个项目处理完成。"
-            return 0
           }
-          # ========================================================
-          # 逐账号执行
-          # ========================================================
+
+          # ==========================================================
+          # 逐账号部署
+          # ==========================================================
           for ((i=0; i<ACCOUNT_COUNT; i++)); do
             if ! deploy_one "${i}"; then
               FAILED_PROJECTS+=("$((i + 1))")
             fi
           done
-          # ========================================================
-          # 重新同步远程 main
-          #
-          # 避免运行过程中 domain.txt 被其他提交覆盖。
-          # ========================================================
+
+          # ==========================================================
+          # 防止期间有人更新 main / domain.txt：
+          # 同一 workflow 组内部已串行；这里再同步远端。
+          # ==========================================================
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
           git fetch origin "${GITHUB_REF_NAME}" --quiet
-          git rebase "origin/${GITHUB_REF_NAME}"
-          # ========================================================
+
+          # 只处理“远端在本次 workflow 开始后新增的提交”。
+          # 如果本地已经跟随远端，则不执行 rebase。
+          if ! git merge-base --is-ancestor "HEAD" "origin/${GITHUB_REF_NAME}"; then
+            git rebase "origin/${GITHUB_REF_NAME}"
+          fi
+
+          # ==========================================================
           # 读取旧 domain.txt
           #
-          # 新格式：
+          # 格式：
+          #   第一段：/admin 地址
+          #   空行
+          #   第二段：Host
           #
-          # 全部 /admin
-          #
-          # 空行
-          #
-          # 全部 Host
-          #
-          # 同时兼容旧版本只有 /admin 的文件。
-          # ========================================================
+          # 为了兼容旧仓库，也支持只有第一段的文件。
+          # ==========================================================
           declare -a OLD_ADMIN_DOMAINS=()
           declare -a OLD_HOST_DOMAINS=()
+
           if [[ -f domain.txt ]]; then
-            DOMAIN_SECTION="admin"
+            section="admin"
+
             while IFS= read -r old_domain || [[ -n "${old_domain}" ]]; do
               old_domain="${old_domain%$'\r'}"
+
               if [[ -z "${old_domain}" ]]; then
-                DOMAIN_SECTION="host"
+                section="host"
                 continue
               fi
-              if [[ "${DOMAIN_SECTION}" == "admin" ]]; then
+
+              if [[ "${section}" == "admin" ]]; then
                 OLD_ADMIN_DOMAINS+=("${old_domain}")
               else
                 OLD_HOST_DOMAINS+=("${old_domain}")
               fi
             done < domain.txt
-            # ======================================================
-            # 旧版 domain.txt 只有 /admin
-            # 自动生成 Host
-            # ======================================================
+
+            # 旧版只有 /admin 时，自动补 Host。
             if (( ${#OLD_HOST_DOMAINS[@]} == 0 &&
                   ${#OLD_ADMIN_DOMAINS[@]} > 0 )); then
               for old_domain in "${OLD_ADMIN_DOMAINS[@]}"; do
@@ -770,71 +920,75 @@ jobs:
               done
             fi
           fi
-          # ========================================================
-          # 成功项目使用新的域名
-          # 失败项目保留旧域名
-          # ========================================================
+
+          # ==========================================================
+          # 成功项目：采用本次检测到的新域名
+          # 失败项目：完整保留旧域名
+          # ==========================================================
           for ((i=0; i<ACCOUNT_COUNT; i++)); do
             if [[ -z "${ADMIN_DOMAINS[$i]:-}" &&
                   -n "${OLD_ADMIN_DOMAINS[$i]:-}" ]]; then
               ADMIN_DOMAINS[$i]="${OLD_ADMIN_DOMAINS[$i]}"
             fi
+
             if [[ -z "${HOST_DOMAINS[$i]:-}" &&
                   -n "${OLD_HOST_DOMAINS[$i]:-}" ]]; then
               HOST_DOMAINS[$i]="${OLD_HOST_DOMAINS[$i]}"
             fi
           done
-          # ========================================================
-          # 生成新的 domain.txt
-          #
-          # 第一部分：
-          # 全部管理员地址
-          #
-          # 第二部分：
-          # 全部 Host
-          # ========================================================
-          DOMAIN_NEXT="${WORK_DIR}/domain.next.txt"
+
+          # ==========================================================
+          # 生成 domain.txt
+          # 不排序、不去重，严格按项目序号 1..N 输出，
+          # 所以新增账号会自然追加在对应序号位置。
+          # ==========================================================
           : > "${DOMAIN_NEXT}"
+
           for ((i=0; i<ACCOUNT_COUNT; i++)); do
             if [[ -n "${ADMIN_DOMAINS[$i]:-}" ]]; then
               printf '%s\n' "${ADMIN_DOMAINS[$i]}" >> "${DOMAIN_NEXT}"
             fi
           done
+
           printf '\n' >> "${DOMAIN_NEXT}"
+
           for ((i=0; i<ACCOUNT_COUNT; i++)); do
             if [[ -n "${HOST_DOMAINS[$i]:-}" ]]; then
               printf '%s\n' "${HOST_DOMAINS[$i]}" >> "${DOMAIN_NEXT}"
             fi
           done
-          # ========================================================
-          # 只有内容真正变化才提交
-          # ========================================================
+
+          # ==========================================================
+          # 输出与提交
+          # ==========================================================
+          echo ""
+          echo "================ domain.txt ================"
+          cat "${DOMAIN_NEXT}"
+          echo "============================================="
+
           if [[ -f domain.txt ]] &&
              cmp -s "${DOMAIN_NEXT}" domain.txt; then
             echo "✨ domain.txt 内容无变化，跳过 Commit。"
             rm -f "${DOMAIN_NEXT}"
           else
             mv "${DOMAIN_NEXT}" domain.txt
-            echo "📝 domain.txt 有变化。"
-            echo ""
-            echo "================ domain.txt ================"
-            cat domain.txt
-            echo "============================================="
+
             git add domain.txt
             git commit \
               -m "chore: auto update deployed domains list [skip ci]"
+
             git push origin "HEAD:${GITHUB_REF_NAME}"
+
             echo "✅ domain.txt 已推送到 GitHub。"
           fi
-          # ========================================================
-          # 最终结果
-          # ========================================================
+
           if (( ${#FAILED_PROJECTS[@]} > 0 )); then
             echo ""
             echo "❌ 以下项目本次未完整完成：${FAILED_PROJECTS[*]}"
             echo "ℹ️ 已成功部署：${DEPLOYED_COUNT}/${ACCOUNT_COUNT}"
             exit 1
           fi
+
           echo ""
           echo "=================================================="
           echo "🎉 全部 ${ACCOUNT_COUNT} 个项目部署完成！"
