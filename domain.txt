@@ -1,13 +1,13 @@
-https://1-3da.pages.dev/admin
-https://2-9lg.pages.dev/admin
-https://3-42i.pages.dev/admin
-https://4-3l4.pages.dev/admin
-https://5-534.pages.dev/admin
-https://6-c5y.pages.dev/admin
+https://1.pages.l.cd/admin
+https://2.pages.l.cd/admin
+https://3.pages.l.cd/admin
+https://4.pages.l.cd/admin
+https://5.pages.l.cd/admin
+https://6.pages.l.cd/admin
 
-1-3da.pages.dev
-2-9lg.pages.dev
-3-42i.pages.dev
-4-3l4.pages.dev
-5-534.pages.dev
-6-c5y.pages.dev
+1.pages.l.cd
+2.pages.l.cd
+3.pages.l.cd
+4.pages.l.cd
+5.pages.l.cd
+6.pages.l.cd
