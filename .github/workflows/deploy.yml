@@ -6,6 +6,7 @@ on:
       - main
     paths-ignore:
       - domain.txt
+      - .github/workflows/edgetunnel-settings.json
   schedule:
     # 台湾时间每天 08:00
     - cron: "0 8 * * *"
@@ -14,6 +15,104 @@ on:
     - cron: "0 19 * * *"
       timezone: "Asia/Taipei"
   workflow_dispatch:
+    inputs:
+      preload_race_dial:
+        description: "预加载竞速拨号 · 默认=不设置，启用=写入 1"
+        required: true
+        type: choice
+        default: "默认（不设置）"
+        options:
+          - "默认（不设置）"
+          - "启用（1）"
+      tcp_concurrent_dial_mode:
+        description: "TCP 并发拨号数 · 默认=不设置，自定义=填写正整数"
+        required: true
+        type: choice
+        default: "默认（不设置）"
+        options:
+          - "默认（不设置）"
+          - "自定义"
+      tcp_concurrent_dial_value:
+        description: "TCP 并发拨号数 · 仅选择“自定义”时使用"
+        required: false
+        type: string
+        default: "2"
+      proxy_concurrent_dial_mode:
+        description: "反代并发拨号数 · 默认=不设置，自定义=填写正整数"
+        required: true
+        type: choice
+        default: "默认（不设置）"
+        options:
+          - "默认（不设置）"
+          - "自定义"
+      proxy_concurrent_dial_value:
+        description: "反代并发拨号数 · 仅选择“自定义”时使用；数值越高切换 IP 越频繁"
+        required: false
+        type: string
+        default: "1"
+      url_mode:
+        description: "默认主页伪装地址 · 默认=不设置，自定义=填写 URL 或 1101"
+        required: true
+        type: choice
+        default: "默认（不设置）"
+        options:
+          - "默认（不设置）"
+          - "自定义"
+      url_value:
+        description: "默认主页伪装地址 · 仅选择“自定义”时使用；示例值可直接修改"
+        required: false
+        type: string
+        default: "https://cloudflare-error-page-3th.pages.dev"
+      proxyip_mode:
+        description: "全局自定义反代 IP · 默认=不设置，自定义=填写地址"
+        required: true
+        type: choice
+        default: "默认（不设置）"
+        options:
+          - "默认（不设置）"
+          - "自定义"
+      proxyip_value:
+        description: "全局自定义反代 IP · 仅选择“自定义”时使用；示例值可直接修改"
+        required: false
+        type: string
+        default: "proxyip.cmliussss.net:443"
+      go2socks5_mode:
+        description: "强制走 SOCKS5 的名单 · 默认=不设置，自定义=填写逗号分隔名单"
+        required: true
+        type: choice
+        default: "默认（不设置）"
+        options:
+          - "默认（不设置）"
+          - "自定义"
+      go2socks5_value:
+        description: "SOCKS5 名单 · 仅选择“自定义”时使用；逗号分隔，例如 README 示例"
+        required: false
+        type: string
+        default: "blog.cmliussss.com,*.ip111.cn,*google.com"
+      debug:
+        description: "开发者模式 · 默认=关闭，启用=写入 1"
+        required: true
+        type: choice
+        default: "默认（不设置）"
+        options:
+          - "默认（不设置）"
+          - "启用（1）"
+      off_log:
+        description: "关闭 KV 日志记录 · 默认=保持开启，启用=写入 1"
+        required: true
+        type: choice
+        default: "默认（不设置）"
+        options:
+          - "默认（不设置）"
+          - "关闭日志（1）"
+      best_sub:
+        description: "优选订阅生成器 · 默认=关闭，启用=写入 1"
+        required: true
+        type: choice
+        default: "默认（不设置）"
+        options:
+          - "默认（不设置）"
+          - "启用（1）"
 
 permissions:
   contents: write
@@ -35,7 +134,7 @@ jobs:
           fetch-depth: 0
 
       - name: Setup Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v7
         with:
           node-version: "24.x"
           check-latest: true
@@ -63,39 +162,369 @@ jobs:
           CF_ACCOUNTS: ${{ secrets.CF_ACCOUNTS }}
           ADMIN_PASS: ${{ secrets.ADMIN }}
           UUID_CONFIG: ${{ secrets.UUID }}
+          KEY_PASS: ${{ secrets.KEY }}
           GITHUB_TOKEN: ${{ github.token }}
           WRANGLER_BIN: ${{ runner.temp }}/wrangler/node_modules/.bin/wrangler
+          IS_MANUAL: ${{ github.event_name == 'workflow_dispatch' }}
+          INPUT_PRELOAD_RACE_DIAL: ${{ inputs.preload_race_dial }}
+          INPUT_TCP_CONCURRENT_DIAL_MODE: ${{ inputs.tcp_concurrent_dial_mode }}
+          INPUT_TCP_CONCURRENT_DIAL_VALUE: ${{ inputs.tcp_concurrent_dial_value }}
+          INPUT_PROXY_CONCURRENT_DIAL_MODE: ${{ inputs.proxy_concurrent_dial_mode }}
+          INPUT_PROXY_CONCURRENT_DIAL_VALUE: ${{ inputs.proxy_concurrent_dial_value }}
+          INPUT_URL_MODE: ${{ inputs.url_mode }}
+          INPUT_URL_VALUE: ${{ inputs.url_value }}
+          INPUT_PROXYIP_MODE: ${{ inputs.proxyip_mode }}
+          INPUT_PROXYIP_VALUE: ${{ inputs.proxyip_value }}
+          INPUT_GO2SOCKS5_MODE: ${{ inputs.go2socks5_mode }}
+          INPUT_GO2SOCKS5_VALUE: ${{ inputs.go2socks5_value }}
+          INPUT_DEBUG: ${{ inputs.debug }}
+          INPUT_OFF_LOG: ${{ inputs.off_log }}
+          INPUT_BEST_SUB: ${{ inputs.best_sub }}
         run: |
           set -euo pipefail
 
           # ==========================================================
-          # 【可修改配置区】
-          # ==========================================================
-          # 说明：
-          # 1. UUID_CONFIG 不在这里写死，始终读取 GitHub Secret：UUID。
-          # 2. UUID Secret 格式保持不变：项目序号:UUIDv4
-          #      例如：1:d8b81c2e-2cd7-4537-8594-239fc5654021
-          # 3. UUID_CONFIG 指定的项目是“UUID 提供项目”。
-          #      该项目：必须有 ADMIN，但 Wrangler 配置中不写 UUID。
-          # 4. 其他项目：写入同一个 UUID，但不写 ADMIN。
-          # 5. 不硬编码 UUID 提供项目必须是 1；1/2/3/... 均可。
+          # 【部署配置】
+          #
+          # 敏感变量（只允许来自 GitHub Secrets）：
+          #   ADMIN / UUID / KEY
+          #
+          # 可选变量（只由本段处理）：
+          #   PRELOAD_RACE_DIAL / TCP_CONCURRENT_DIAL /
+          #   PROXY_CONCURRENT_DIAL / URL / PROXYIP /
+          #   GO2SOCKS5 / DEBUG / OFF_LOG / BEST_SUB
+          #
+          # 9 个可选变量：
+          # - workflow_dispatch 手动执行时读取本次选择；
+          # - 自动执行（push / schedule）时读取最近一次手动执行保存的配置；
+          # - “default” 表示完全不写入该变量，让 EdgeTunnel 自身采用默认值。
+          #
+          # 持久化配置只保存这 9 个非敏感变量，绝不保存 ADMIN / UUID / KEY。
           # ==========================================================
           readonly UPSTREAM_REPO="cmliu/edgetunnel"
           readonly UPSTREAM_BRANCH="beta2.1"
-          readonly DEFAULT_URL="https://cloudflare-error-page-3th.pages.dev"
 
-          readonly PRELOAD_RACE_DIAL="1"
-          readonly TCP_CONCURRENT_DIAL="4"
-          readonly PROXY_CONCURRENT_DIAL="4"
+          # README 中给出的示例值；只有选择 custom 时才会作为输入框预填充。
+          readonly URL_EXAMPLE="https://cloudflare-error-page-3th.pages.dev"
+          readonly PROXYIP_EXAMPLE="proxyip.cmliussss.net:443"
+          readonly GO2SOCKS5_EXAMPLE="blog.cmliussss.com,*.ip111.cn,*google.com"
 
           readonly KV_NAME="kv"
           readonly PAGES_PRODUCTION_BRANCH="main"
           readonly API_BASE="https://api.cloudflare.com/client/v4"
+          readonly SETTINGS_FILE="${GITHUB_WORKSPACE}/.github/workflows/edgetunnel-settings.json"
+          # 持久化文件仅包含 9 个非敏感变量；位置与本 workflow 同目录，便于维护。
 
           : "${CF_ACCOUNTS:?❌ 未检测到 CF_ACCOUNTS Secrets 变量}"
           : "${ADMIN_PASS:?❌ 未检测到 ADMIN Secrets 变量}"
           : "${GITHUB_TOKEN:?❌ 未检测到 GITHUB_TOKEN 变量}"
           : "${UUID_CONFIG:=}"
+          : "${KEY_PASS:=}"
+          if [[ -n "${KEY_PASS}" && "${KEY_PASS}" =~ [[:space:]] ]]; then
+            echo "❌ KEY Secret 不能包含空白字符。"
+            exit 1
+          fi
+
+
+          # ----------------------------------------------------------
+          # 9 个可选变量的最终值：
+          # 空字符串 = 不写入 Wrangler vars = 使用 EdgeTunnel 默认值。
+          # ----------------------------------------------------------
+          PRELOAD_RACE_DIAL=""
+          TCP_CONCURRENT_DIAL=""
+          PROXY_CONCURRENT_DIAL=""
+          DEFAULT_URL=""
+          PROXYIP=""
+          GO2SOCKS5=""
+          DEBUG=""
+          OFF_LOG=""
+          BEST_SUB=""
+
+          optional_settings_json() {
+            jq -n \
+              --arg preload "${PRELOAD_RACE_DIAL}" \
+              --arg tcp "${TCP_CONCURRENT_DIAL}" \
+              --arg proxy "${PROXY_CONCURRENT_DIAL}" \
+              --arg url "${DEFAULT_URL}" \
+              --arg proxyip "${PROXYIP}" \
+              --arg socks5 "${GO2SOCKS5}" \
+              --arg debug "${DEBUG}" \
+              --arg off_log "${OFF_LOG}" \
+              --arg best_sub "${BEST_SUB}" \
+              '{
+                preload_race_dial: (if $preload == "" then null else $preload end),
+                tcp_concurrent_dial: (if $tcp == "" then null else $tcp end),
+                proxy_concurrent_dial: (if $proxy == "" then null else $proxy end),
+                url: (if $url == "" then null else $url end),
+                proxyip: (if $proxyip == "" then null else $proxyip end),
+                go2socks5: (if $socks5 == "" then null else $socks5 end),
+                debug: (if $debug == "" then null else $debug end),
+                off_log: (if $off_log == "" then null else $off_log end),
+                best_sub: (if $best_sub == "" then null else $best_sub end)
+              }'
+          }
+
+          validate_positive_integer() {
+            local variable_name="$1"
+            local value="$2"
+
+            if [[ ! "${value}" =~ ^[1-9][0-9]*$ ]]; then
+              echo "❌ ${variable_name} 自定义值必须是正整数。"
+              exit 1
+            fi
+          }
+
+          load_persisted_optional_settings() {
+            if [[ ! -f "${SETTINGS_FILE}" ]]; then
+              return 0
+            fi
+
+            if ! jq -e '
+              type == "object"
+              and (keys | sort) == [
+                "best_sub",
+                "debug",
+                "go2socks5",
+                "off_log",
+                "preload_race_dial",
+                "proxy_concurrent_dial",
+                "proxyip",
+                "tcp_concurrent_dial",
+                "url"
+              ]
+            ' "${SETTINGS_FILE}" >/dev/null 2>&1; then
+              echo "❌ ${SETTINGS_FILE} 格式无效或包含未允许的字段。"
+              echo "❌ 为避免错误变量进入批量部署，本次任务终止。"
+              exit 1
+            fi
+
+            local settings_json
+            settings_json="$(cat "${SETTINGS_FILE}")"
+
+            PRELOAD_RACE_DIAL="$(jq -r '.preload_race_dial // ""' <<< "${settings_json}")"
+            TCP_CONCURRENT_DIAL="$(jq -r '.tcp_concurrent_dial // ""' <<< "${settings_json}")"
+            PROXY_CONCURRENT_DIAL="$(jq -r '.proxy_concurrent_dial // ""' <<< "${settings_json}")"
+            DEFAULT_URL="$(jq -r '.url // ""' <<< "${settings_json}")"
+            PROXYIP="$(jq -r '.proxyip // ""' <<< "${settings_json}")"
+            GO2SOCKS5="$(jq -r '.go2socks5 // ""' <<< "${settings_json}")"
+            DEBUG="$(jq -r '.debug // ""' <<< "${settings_json}")"
+            OFF_LOG="$(jq -r '.off_log // ""' <<< "${settings_json}")"
+            BEST_SUB="$(jq -r '.best_sub // ""' <<< "${settings_json}")"
+          }
+
+          validate_optional_settings() {
+            if [[ -n "${PRELOAD_RACE_DIAL}" && "${PRELOAD_RACE_DIAL}" != "1" ]]; then
+              echo "❌ PRELOAD_RACE_DIAL 持久化值只能是 1 或默认。"
+              exit 1
+            fi
+
+            if [[ -n "${DEBUG}" && "${DEBUG}" != "1" ]]; then
+              echo "❌ DEBUG 持久化值只能是 1 或默认。"
+              exit 1
+            fi
+
+            if [[ -n "${OFF_LOG}" && "${OFF_LOG}" != "1" ]]; then
+              echo "❌ OFF_LOG 持久化值只能是 1 或默认。"
+              exit 1
+            fi
+
+            if [[ -n "${BEST_SUB}" && "${BEST_SUB}" != "1" ]]; then
+              echo "❌ BEST_SUB 持久化值只能是 1 或默认。"
+              exit 1
+            fi
+
+            if [[ -n "${TCP_CONCURRENT_DIAL}" ]]; then
+              validate_positive_integer "TCP_CONCURRENT_DIAL" "${TCP_CONCURRENT_DIAL}"
+            fi
+
+            if [[ -n "${PROXY_CONCURRENT_DIAL}" ]]; then
+              validate_positive_integer "PROXY_CONCURRENT_DIAL" "${PROXY_CONCURRENT_DIAL}"
+            fi
+
+            if [[ -n "${DEFAULT_URL}" ]]; then
+              if [[ "${DEFAULT_URL}" != "1101" && ! "${DEFAULT_URL}" =~ ^https?://[^[:space:]]+$ ]]; then
+                echo "❌ URL 自定义值必须是 HTTP/HTTPS URL，或 README 支持的 1101。"
+                exit 1
+              fi
+            fi
+
+            # PROXYIP / GO2SOCKS5 由上游读取并解释；这里仅拒绝空值。
+            if [[ -n "${PROXYIP}" && "${PROXYIP}" =~ [[:space:]] ]]; then
+              echo "❌ PROXYIP 不应包含空白字符。"
+              exit 1
+            fi
+
+            if [[ -n "${GO2SOCKS5}" && "${GO2SOCKS5}" =~ [[:space:]] ]]; then
+              echo "❌ GO2SOCKS5 不应包含空白字符；请使用逗号分隔域名。"
+              exit 1
+            fi
+          }
+
+          resolve_manual_optional_settings() {
+            # PRELOAD_RACE_DIAL
+            case "${INPUT_PRELOAD_RACE_DIAL}" in
+              默认（不设置）|默认|"") PRELOAD_RACE_DIAL="" ;;
+              启用（1）|1)  PRELOAD_RACE_DIAL="1" ;;
+              *)          echo "❌ PRELOAD_RACE_DIAL 选择无效。"; exit 1 ;;
+            esac
+
+            # TCP_CONCURRENT_DIAL
+            case "${INPUT_TCP_CONCURRENT_DIAL_MODE}" in
+              默认（不设置）|默认|"")
+                TCP_CONCURRENT_DIAL=""
+                ;;
+              自定义)
+                validate_positive_integer "TCP_CONCURRENT_DIAL" "${INPUT_TCP_CONCURRENT_DIAL_VALUE}"
+                TCP_CONCURRENT_DIAL="${INPUT_TCP_CONCURRENT_DIAL_VALUE}"
+                ;;
+              *)
+                echo "❌ TCP_CONCURRENT_DIAL 模式无效。"
+                exit 1
+                ;;
+            esac
+
+            # PROXY_CONCURRENT_DIAL
+            case "${INPUT_PROXY_CONCURRENT_DIAL_MODE}" in
+              默认（不设置）|默认|"")
+                PROXY_CONCURRENT_DIAL=""
+                ;;
+              自定义)
+                validate_positive_integer "PROXY_CONCURRENT_DIAL" "${INPUT_PROXY_CONCURRENT_DIAL_VALUE}"
+                PROXY_CONCURRENT_DIAL="${INPUT_PROXY_CONCURRENT_DIAL_VALUE}"
+                ;;
+              *)
+                echo "❌ PROXY_CONCURRENT_DIAL 模式无效。"
+                exit 1
+                ;;
+            esac
+
+            # URL
+            case "${INPUT_URL_MODE}" in
+              默认（不设置）|默认|"")
+                DEFAULT_URL=""
+                ;;
+              自定义)
+                DEFAULT_URL="$(trim "${INPUT_URL_VALUE}")"
+                if [[ -z "${DEFAULT_URL}" ]]; then
+                  echo "❌ URL 选择“自定义”后必须填写值。"
+                  exit 1
+                fi
+                ;;
+              *)
+                echo "❌ URL 模式无效。"
+                exit 1
+                ;;
+            esac
+
+            # PROXYIP
+            case "${INPUT_PROXYIP_MODE}" in
+              默认（不设置）|默认|"")
+                PROXYIP=""
+                ;;
+              自定义)
+                PROXYIP="$(trim "${INPUT_PROXYIP_VALUE}")"
+                if [[ -z "${PROXYIP}" ]]; then
+                  echo "❌ PROXYIP 选择“自定义”后必须填写值。"
+                  exit 1
+                fi
+                ;;
+              *)
+                echo "❌ PROXYIP 模式无效。"
+                exit 1
+                ;;
+            esac
+
+            # GO2SOCKS5
+            case "${INPUT_GO2SOCKS5_MODE}" in
+              默认（不设置）|默认|"")
+                GO2SOCKS5=""
+                ;;
+              自定义)
+                GO2SOCKS5="$(trim "${INPUT_GO2SOCKS5_VALUE}")"
+                if [[ -z "${GO2SOCKS5}" ]]; then
+                  echo "❌ GO2SOCKS5 选择“自定义”后必须填写值。"
+                  exit 1
+                fi
+                ;;
+              *)
+                echo "❌ GO2SOCKS5 模式无效。"
+                exit 1
+                ;;
+            esac
+
+            # DEBUG / OFF_LOG / BEST_SUB
+            case "${INPUT_DEBUG}" in
+              默认（不设置）|默认|"") DEBUG="" ;;
+              启用（1）|1)  DEBUG="1" ;;
+              *)          echo "❌ DEBUG 选择无效。"; exit 1 ;;
+            esac
+
+            case "${INPUT_OFF_LOG}" in
+              默认（不设置）|默认|"") OFF_LOG="" ;;
+              关闭日志（1）|1)  OFF_LOG="1" ;;
+              *)          echo "❌ OFF_LOG 选择无效。"; exit 1 ;;
+            esac
+
+            case "${INPUT_BEST_SUB}" in
+              默认（不设置）|默认|"") BEST_SUB="" ;;
+              启用（1）|1)  BEST_SUB="1" ;;
+              *)          echo "❌ BEST_SUB 选择无效。"; exit 1 ;;
+            esac
+          }
+
+          save_manual_optional_settings() {
+            local settings_dir
+            local settings_tmp
+            local settings_status
+
+            settings_dir="$(dirname "${SETTINGS_FILE}")"
+            settings_tmp="${SETTINGS_FILE}.tmp"
+            mkdir -p "${settings_dir}"
+
+            # 先同步到远端最新提交，避免把并发产生的其他仓库更新覆盖掉。
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git fetch origin "${GITHUB_REF_NAME}" --quiet
+            git reset --hard "origin/${GITHUB_REF_NAME}"
+
+            optional_settings_json > "${settings_tmp}"
+            mv "${settings_tmp}" "${SETTINGS_FILE}"
+
+            settings_status="$(git status --porcelain=v1 -- "${SETTINGS_FILE}")"
+
+            if [[ -z "${settings_status}" ]]; then
+              echo "ℹ️ 手动选择与上次持久化配置相同，无需更新设置文件。"
+              return 0
+            fi
+
+            git add "${SETTINGS_FILE}"
+            git commit -m "chore: update EdgeTunnel deploy settings [skip ci]"
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+
+            # 推送成功后重新定位到远端最新提交，确保后续 domain.txt 操作从最新仓库状态继续。
+            git fetch origin "${GITHUB_REF_NAME}" --quiet
+            git reset --hard "origin/${GITHUB_REF_NAME}"
+
+            echo "✅ 本次手动选择已持久化；后续自动部署将沿用这 9 个变量的状态。"
+          }
+
+          load_or_resolve_optional_settings() {
+            if [[ "${IS_MANUAL}" == "true" ]]; then
+              resolve_manual_optional_settings
+              validate_optional_settings
+              save_manual_optional_settings
+            else
+              load_persisted_optional_settings
+              validate_optional_settings
+            fi
+          }
+
+          trim() {
+            local value="${1:-}"
+            value="${value#"${value%%[![:space:]]*}"}"
+            value="${value%"${value##*[![:space:]]}"}"
+            printf '%s' "${value}"
+          }
 
           if [[ ! -x "${WRANGLER_BIN}" ]]; then
             echo "❌ Wrangler 未正确安装：${WRANGLER_BIN}"
@@ -115,6 +544,8 @@ jobs:
           require_cmd sha256sum
           require_cmd git
 
+          load_or_resolve_optional_settings
+
           readonly ZIP_URL="https://github.com/${UPSTREAM_REPO}/archive/refs/heads/${UPSTREAM_BRANCH}.zip"
 
           echo "=================================================="
@@ -123,11 +554,25 @@ jobs:
           echo "📦 上游仓库：${UPSTREAM_REPO}"
           echo "🌿 上游分支：${UPSTREAM_BRANCH}"
           echo "🔗 ZIP：${ZIP_URL}"
-          echo "🌐 URL：${DEFAULT_URL}"
-          echo "⚙️ PRELOAD_RACE_DIAL=${PRELOAD_RACE_DIAL}"
-          echo "⚙️ TCP_CONCURRENT_DIAL=${TCP_CONCURRENT_DIAL}"
-          echo "⚙️ PROXY_CONCURRENT_DIAL=${PROXY_CONCURRENT_DIAL}"
+          echo "🔐 ADMIN / UUID / KEY：仅从 GitHub Secrets 读取，不打印值"
+          echo "⚙️ 可选变量状态："
+          [[ -n "${PRELOAD_RACE_DIAL}" ]] && echo "   PRELOAD_RACE_DIAL=1" || echo "   PRELOAD_RACE_DIAL=默认"
+          [[ -n "${TCP_CONCURRENT_DIAL}" ]] && echo "   TCP_CONCURRENT_DIAL=自定义（数值不打印）" || echo "   TCP_CONCURRENT_DIAL=默认"
+          [[ -n "${PROXY_CONCURRENT_DIAL}" ]] && echo "   PROXY_CONCURRENT_DIAL=自定义（数值不打印）" || echo "   PROXY_CONCURRENT_DIAL=默认"
+          [[ -n "${DEFAULT_URL}" ]] && echo "   URL=自定义（值不打印）" || echo "   URL=默认"
+          [[ -n "${PROXYIP}" ]] && echo "   PROXYIP=自定义（值不打印）" || echo "   PROXYIP=默认"
+          [[ -n "${GO2SOCKS5}" ]] && echo "   GO2SOCKS5=自定义（值不打印）" || echo "   GO2SOCKS5=默认"
+          [[ -n "${DEBUG}" ]] && echo "   DEBUG=1" || echo "   DEBUG=默认"
+          [[ -n "${OFF_LOG}" ]] && echo "   OFF_LOG=1" || echo "   OFF_LOG=默认"
+          [[ -n "${BEST_SUB}" ]] && echo "   BEST_SUB=1" || echo "   BEST_SUB=默认"
           echo "📦 KV：${KV_NAME}"
+          if [[ "${IS_MANUAL}" == "true" ]]; then
+            echo "🖐️ 运行方式：手动执行（本次选择会保存）"
+          else
+            echo "⏱️ 运行方式：自动执行（沿用最近一次手动保存）"
+          fi
+          echo "🔐 ADMIN / UUID / KEY：仅从 GitHub Secrets 读取，不打印值"
+          echo "⚙️ 9 个可选变量：默认状态不写入；其余状态不打印实际值"
           echo "=================================================="
 
           # ==========================================================
@@ -288,14 +733,13 @@ jobs:
           # ==========================================================
           # UUID 配置
           #
-          # UUID_CONFIG 格式严格保持：项目序号:UUIDv4
-          # 例如：1:d8b81c2e-2cd7-4537-8594-239fc5654021
+          # 保持原脚本的 UUID Secret 语义，不在本次改动中重构：
+          # UUID_CONFIG 格式：项目序号:UUIDv4
+          # - 指定的“UUID 提供项目”写 ADMIN、不写 UUID；
+          # - 其他项目写固定 UUID、不写 ADMIN；
+          # - 未配置 UUID Secret 时，保持原脚本的独立项目行为。
           #
-          # 注意：
-          # - 不硬编码 UUID 提供项目必须是 1。
-          # - 不尝试从 Cloudflare / Pages 面板“获取”UUID。
-          # - UUID 是用户自己从面板取得后放入 GitHub Secret UUID 的。
-          # - 提供项目本身不写 UUID；其他项目写同一个 UUID。
+          # UUID 的真实值只来自 GitHub Secret，日志不打印其内容。
           # ==========================================================
           UUID_SOURCE_INDEX=""
           SHARED_UUID=""
@@ -317,7 +761,7 @@ jobs:
             else
               echo "❌ UUID Secret 格式无效。"
               echo "❌ 正确格式：项目序号:UUIDv4"
-              echo "❌ 示例：1:d8b81c2e-2cd7-4537-8594-239fc5654021"
+              echo "❌ 示例：1:UUIDv4 示例（请勿填写真实密钥）"
               exit 1
             fi
           else
@@ -408,8 +852,9 @@ jobs:
           # ==========================================================
           # 生成完整 Wrangler 配置
           #
-          # Cloudflare Pages 使用 Wrangler 配置文件后，该文件成为 source of truth。
-          # 因此所有要交给 Wrangler 管理的生产变量与 KV 都必须写进配置。
+          # Wrangler vars 对应 Pages 生产环境的明文环境变量；
+          # 按用户要求，ADMIN / UUID / KEY 也写入 vars，而不是 secret_text。
+          # 它们只在 Runner 临时目录生成，绝不写入仓库。
           # ==========================================================
           write_wrangler_config() {
             local project_name="$1"
@@ -418,126 +863,54 @@ jobs:
             local include_admin="$4"
             local config_file="${PAYLOAD_DIR}/wrangler.json"
 
-            if [[ "${include_admin}" == "true" && -n "${shared_uuid}" ]]; then
-              jq -n \
-                --arg name "${project_name}" \
-                --arg compatibility_date "${COMPATIBILITY_DATE}" \
-                --arg admin "${ADMIN_PASS}" \
-                --arg url "${DEFAULT_URL}" \
-                --arg preload "${PRELOAD_RACE_DIAL}" \
-                --arg tcp "${TCP_CONCURRENT_DIAL}" \
-                --arg proxy "${PROXY_CONCURRENT_DIAL}" \
-                --arg uuid "${shared_uuid}" \
-                --arg kv_id "${kv_id}" \
-                '{
-                  name: $name,
-                  pages_build_output_dir: ".",
-                  compatibility_date: $compatibility_date,
-                  vars: {
-                    ADMIN: $admin,
-                    URL: $url,
-                    PRELOAD_RACE_DIAL: $preload,
-                    TCP_CONCURRENT_DIAL: $tcp,
-                    PROXY_CONCURRENT_DIAL: $proxy,
-                    UUID: $uuid
-                  },
-                  kv_namespaces: [
-                    {binding: "KV", id: $kv_id}
-                  ]
-                }' > "${config_file}"
-
-            elif [[ "${include_admin}" == "true" ]]; then
-              jq -n \
-                --arg name "${project_name}" \
-                --arg compatibility_date "${COMPATIBILITY_DATE}" \
-                --arg admin "${ADMIN_PASS}" \
-                --arg url "${DEFAULT_URL}" \
-                --arg preload "${PRELOAD_RACE_DIAL}" \
-                --arg tcp "${TCP_CONCURRENT_DIAL}" \
-                --arg proxy "${PROXY_CONCURRENT_DIAL}" \
-                --arg kv_id "${kv_id}" \
-                '{
-                  name: $name,
-                  pages_build_output_dir: ".",
-                  compatibility_date: $compatibility_date,
-                  vars: {
-                    ADMIN: $admin,
-                    URL: $url,
-                    PRELOAD_RACE_DIAL: $preload,
-                    TCP_CONCURRENT_DIAL: $tcp,
-                    PROXY_CONCURRENT_DIAL: $proxy
-                  },
-                  kv_namespaces: [
-                    {binding: "KV", id: $kv_id}
-                  ]
-                }' > "${config_file}"
-
-            elif [[ -n "${shared_uuid}" ]]; then
-              jq -n \
-                --arg name "${project_name}" \
-                --arg compatibility_date "${COMPATIBILITY_DATE}" \
-                --arg url "${DEFAULT_URL}" \
-                --arg preload "${PRELOAD_RACE_DIAL}" \
-                --arg tcp "${TCP_CONCURRENT_DIAL}" \
-                --arg proxy "${PROXY_CONCURRENT_DIAL}" \
-                --arg uuid "${shared_uuid}" \
-                --arg kv_id "${kv_id}" \
-                '{
-                  name: $name,
-                  pages_build_output_dir: ".",
-                  compatibility_date: $compatibility_date,
-                  vars: {
-                    URL: $url,
-                    PRELOAD_RACE_DIAL: $preload,
-                    TCP_CONCURRENT_DIAL: $tcp,
-                    PROXY_CONCURRENT_DIAL: $proxy,
-                    UUID: $uuid
-                  },
-                  kv_namespaces: [
-                    {binding: "KV", id: $kv_id}
-                  ]
-                }' > "${config_file}"
-
-            else
-              jq -n \
-                --arg name "${project_name}" \
-                --arg compatibility_date "${COMPATIBILITY_DATE}" \
-                --arg url "${DEFAULT_URL}" \
-                --arg preload "${PRELOAD_RACE_DIAL}" \
-                --arg tcp "${TCP_CONCURRENT_DIAL}" \
-                --arg proxy "${PROXY_CONCURRENT_DIAL}" \
-                --arg kv_id "${kv_id}" \
-                '{
-                  name: $name,
-                  pages_build_output_dir: ".",
-                  compatibility_date: $compatibility_date,
-                  vars: {
-                    URL: $url,
-                    PRELOAD_RACE_DIAL: $preload,
-                    TCP_CONCURRENT_DIAL: $tcp,
-                    PROXY_CONCURRENT_DIAL: $proxy
-                  },
-                  kv_namespaces: [
-                    {binding: "KV", id: $kv_id}
-                  ]
-                }' > "${config_file}"
-            fi
+            jq -n \
+              --arg name "${project_name}" \
+              --arg compatibility_date "${COMPATIBILITY_DATE}" \
+              --arg admin "${ADMIN_PASS}" \
+              --arg key "${KEY_PASS}" \
+              --arg uuid "${shared_uuid}" \
+              --arg include_admin "${include_admin}" \
+              --arg url "${DEFAULT_URL}" \
+              --arg proxyip "${PROXYIP}" \
+              --arg socks5 "${GO2SOCKS5}" \
+              --arg debug "${DEBUG}" \
+              --arg off_log "${OFF_LOG}" \
+              --arg best_sub "${BEST_SUB}" \
+              --arg preload "${PRELOAD_RACE_DIAL}" \
+              --arg tcp "${TCP_CONCURRENT_DIAL}" \
+              --arg proxy "${PROXY_CONCURRENT_DIAL}" \
+              --arg kv_id "${kv_id}" \
+              '{
+                name: $name,
+                pages_build_output_dir: ".",
+                compatibility_date: $compatibility_date,
+                vars: (
+                  {}
+                  + (if $include_admin == "true" then {ADMIN: $admin} else {} end)
+                  + (if $key != "" then {KEY: $key} else {} end)
+                  + (if $uuid != "" then {UUID: $uuid} else {} end)
+                  + (if $url != "" then {URL: $url} else {} end)
+                  + (if $proxyip != "" then {PROXYIP: $proxyip} else {} end)
+                  + (if $socks5 != "" then {GO2SOCKS5: $socks5} else {} end)
+                  + (if $debug != "" then {DEBUG: $debug} else {} end)
+                  + (if $off_log != "" then {OFF_LOG: $off_log} else {} end)
+                  + (if $best_sub != "" then {BEST_SUB: $best_sub} else {} end)
+                  + (if $preload != "" then {PRELOAD_RACE_DIAL: $preload} else {} end)
+                  + (if $tcp != "" then {TCP_CONCURRENT_DIAL: $tcp} else {} end)
+                  + (if $proxy != "" then {PROXY_CONCURRENT_DIAL: $proxy} else {} end)
+                ),
+                kv_namespaces: [
+                  {binding: "KV", id: $kv_id}
+                ]
+              }' > "${config_file}"
 
             jq empty "${config_file}"
 
-            if [[ "${include_admin}" == "true" ]]; then
-              if [[ -n "${shared_uuid}" ]]; then
-                echo "📄 Wrangler 配置：ADMIN + 4 公共变量 + UUID + KV"
-              else
-                echo "📄 Wrangler 配置：ADMIN + 3 公共变量 + KV（不写 UUID）"
-              fi
-            else
-              if [[ -n "${shared_uuid}" ]]; then
-                echo "📄 Wrangler 配置：4 公共变量 + UUID + KV（不写 ADMIN）"
-              else
-                echo "📄 Wrangler 配置：3 公共变量 + KV（不写 ADMIN / UUID）"
-              fi
-            fi
+            echo "📄 Wrangler 配置已生成：敏感变量只在 Runner 临时文件中使用。"
+            echo "   ADMIN：$([[ "${include_admin}" == "true" ]] && echo "写入" || echo "不写入")"
+            echo "   UUID：$([[ -n "${shared_uuid}" ]] && echo "写入" || echo "不写入")"
+            echo "   KEY：$([[ -n "${KEY_PASS}" ]] && echo "写入" || echo "不写入")"
+            echo "   其余 9 个变量按本次持久化选择写入；实际值不打印。"
           }
 
           # ==========================================================
@@ -617,37 +990,40 @@ jobs:
 
           # ==========================================================
           # 配置验证
-          # 注意：
-          # - UUID 提供项目不验证 UUID，因为它按设计不写 UUID。
-          # - 非提供项目必须验证 UUID。
-          # - ADMIN 只有 UUID 提供项目必须验证。
+          #
+          # 验证 Cloudflare Pages API 返回的 production env_vars：
+          # - 应写入的变量：存在、类型为 plain_text、值与预期一致；
+          # - default 状态的 9 个变量：必须不存在；
+          # - ADMIN / UUID 保持现有聚合逻辑；
+          # - KEY 若 Secret 存在，则所有项目写入。
           # ==========================================================
           verify_production_config() {
             local project_json="$1"
             local expect_admin="$2"
             local expect_uuid="$3"
             local expect_kv="$4"
-            local expected_admin="${ADMIN_PASS}"
 
             jq -e \
-              --arg admin "${expected_admin}" \
+              --arg admin "${ADMIN_PASS}" \
+              --arg key "${KEY_PASS}" \
               --arg expect_admin "${expect_admin}" \
               --arg expect_uuid "${expect_uuid}" \
               --arg kv_id "${expect_kv}" \
               --arg url "${DEFAULT_URL}" \
+              --arg proxyip "${PROXYIP}" \
+              --arg socks5 "${GO2SOCKS5}" \
+              --arg debug "${DEBUG}" \
+              --arg off_log "${OFF_LOG}" \
+              --arg best_sub "${BEST_SUB}" \
               --arg preload "${PRELOAD_RACE_DIAL}" \
               --arg tcp "${TCP_CONCURRENT_DIAL}" \
               --arg proxy "${PROXY_CONCURRENT_DIAL}" \
               '.success == true
                and (.result.deployment_configs.production.env_vars // {} | type) == "object"
-               and (.result.deployment_configs.production.env_vars.URL.value // "") == $url
-               and (.result.deployment_configs.production.env_vars.PRELOAD_RACE_DIAL.value // "") == $preload
-               and (.result.deployment_configs.production.env_vars.TCP_CONCURRENT_DIAL.value // "") == $tcp
-               and (.result.deployment_configs.production.env_vars.PROXY_CONCURRENT_DIAL.value // "") == $proxy
                and (.result.deployment_configs.production.kv_namespaces.KV.namespace_id // "") == $kv_id
                and (
                  ($expect_admin == "true"
-                   and (.result.deployment_configs.production.env_vars | has("ADMIN"))
+                   and (.result.deployment_configs.production.env_vars.ADMIN.type // "") == "plain_text"
                    and (.result.deployment_configs.production.env_vars.ADMIN.value // "") == $admin)
                  or
                  ($expect_admin != "true"
@@ -655,11 +1031,91 @@ jobs:
                )
                and (
                  ($expect_uuid != ""
-                   and (.result.deployment_configs.production.env_vars | has("UUID"))
+                   and (.result.deployment_configs.production.env_vars.UUID.type // "") == "plain_text"
                    and (.result.deployment_configs.production.env_vars.UUID.value // "") == $expect_uuid)
                  or
                  ($expect_uuid == ""
                    and (.result.deployment_configs.production.env_vars | has("UUID") | not))
+               )
+               and (
+                 ($key != ""
+                   and (.result.deployment_configs.production.env_vars.KEY.type // "") == "plain_text"
+                   and (.result.deployment_configs.production.env_vars.KEY.value // "") == $key)
+                 or
+                 ($key == ""
+                   and (.result.deployment_configs.production.env_vars | has("KEY") | not))
+               )
+               and (
+                 ($url != ""
+                   and (.result.deployment_configs.production.env_vars.URL.type // "") == "plain_text"
+                   and (.result.deployment_configs.production.env_vars.URL.value // "") == $url)
+                 or
+                 ($url == ""
+                   and (.result.deployment_configs.production.env_vars | has("URL") | not))
+               )
+               and (
+                 ($proxyip != ""
+                   and (.result.deployment_configs.production.env_vars.PROXYIP.type // "") == "plain_text"
+                   and (.result.deployment_configs.production.env_vars.PROXYIP.value // "") == $proxyip)
+                 or
+                 ($proxyip == ""
+                   and (.result.deployment_configs.production.env_vars | has("PROXYIP") | not))
+               )
+               and (
+                 ($socks5 != ""
+                   and (.result.deployment_configs.production.env_vars.GO2SOCKS5.type // "") == "plain_text"
+                   and (.result.deployment_configs.production.env_vars.GO2SOCKS5.value // "") == $socks5)
+                 or
+                 ($socks5 == ""
+                   and (.result.deployment_configs.production.env_vars | has("GO2SOCKS5") | not))
+               )
+               and (
+                 ($debug != ""
+                   and (.result.deployment_configs.production.env_vars.DEBUG.type // "") == "plain_text"
+                   and (.result.deployment_configs.production.env_vars.DEBUG.value // "") == $debug)
+                 or
+                 ($debug == ""
+                   and (.result.deployment_configs.production.env_vars | has("DEBUG") | not))
+               )
+               and (
+                 ($off_log != ""
+                   and (.result.deployment_configs.production.env_vars.OFF_LOG.type // "") == "plain_text"
+                   and (.result.deployment_configs.production.env_vars.OFF_LOG.value // "") == $off_log)
+                 or
+                 ($off_log == ""
+                   and (.result.deployment_configs.production.env_vars | has("OFF_LOG") | not))
+               )
+               and (
+                 ($best_sub != ""
+                   and (.result.deployment_configs.production.env_vars.BEST_SUB.type // "") == "plain_text"
+                   and (.result.deployment_configs.production.env_vars.BEST_SUB.value // "") == $best_sub)
+                 or
+                 ($best_sub == ""
+                   and (.result.deployment_configs.production.env_vars | has("BEST_SUB") | not))
+               )
+               and (
+                 ($preload != ""
+                   and (.result.deployment_configs.production.env_vars.PRELOAD_RACE_DIAL.type // "") == "plain_text"
+                   and (.result.deployment_configs.production.env_vars.PRELOAD_RACE_DIAL.value // "") == $preload)
+                 or
+                 ($preload == ""
+                   and (.result.deployment_configs.production.env_vars | has("PRELOAD_RACE_DIAL") | not))
+               )
+               and (
+                 ($tcp != ""
+                   and (.result.deployment_configs.production.env_vars.TCP_CONCURRENT_DIAL.type // "") == "plain_text"
+                   and (.result.deployment_configs.production.env_vars.TCP_CONCURRENT_DIAL.value // "") == $tcp)
+                 or
+                 ($tcp == ""
+                   and (.result.deployment_configs.production.env_vars | has("TCP_CONCURRENT_DIAL") | not))
+               )
+               and (
+                 ($proxy != ""
+                   and (.result.deployment_configs.production.env_vars.PROXY_CONCURRENT_DIAL.type // "") == "plain_text"
+                   and (.result.deployment_configs.production.env_vars.PROXY_CONCURRENT_DIAL.value // "") == $proxy)
+                 or
+                 ($proxy == ""
+                   and (.result.deployment_configs.production.env_vars | has("PROXY_CONCURRENT_DIAL") | not))
                )' \
               >/dev/null <<< "${project_json}"
           }
@@ -738,12 +1194,18 @@ jobs:
                 echo "   ✅ 不写 UUID"
               else
                 echo "🧩 角色：UUID 聚合节点"
-                echo "   ✅ 写入固定 UUID"
+                echo "   ✅ 写入固定 UUID（值不打印）"
                 echo "   ✅ 不写 ADMIN"
               fi
             else
               echo "🧩 角色：独立项目（未启用 UUID 聚合）"
               echo "   ✅ 写入 ADMIN"
+            fi
+
+            if [[ -n "${KEY_PASS}" ]]; then
+              echo "   ✅ KEY：写入（Secret 值不打印）"
+            else
+              echo "   ℹ️ KEY：未配置"
             fi
 
             # ----------------------------------------------------------
@@ -867,9 +1329,9 @@ jobs:
               fi
 
               kv_id="$(jq -r '.result.id' <<< "${create_resp}")"
-              echo "✅ KV 创建成功：${kv_id}"
+              echo "✅ KV 创建成功。"
             else
-              echo "✅ 已存在 KV：${kv_id}"
+              echo "✅ 已存在所需 KV。"
             fi
 
             # ----------------------------------------------------------
@@ -924,17 +1386,9 @@ jobs:
               return 1
             fi
 
-            if [[ "${expected_admin}" == "true" && -n "${deploy_uuid}" ]]; then
-              echo "✅ Pages 环境变量已验证：ADMIN / URL / PRELOAD_RACE_DIAL / TCP_CONCURRENT_DIAL / PROXY_CONCURRENT_DIAL / UUID"
-            elif [[ "${expected_admin}" == "true" ]]; then
-              echo "✅ Pages 环境变量已验证：ADMIN / URL / PRELOAD_RACE_DIAL / TCP_CONCURRENT_DIAL / PROXY_CONCURRENT_DIAL"
-            elif [[ -n "${deploy_uuid}" ]]; then
-              echo "✅ Pages 环境变量已验证：URL / PRELOAD_RACE_DIAL / TCP_CONCURRENT_DIAL / PROXY_CONCURRENT_DIAL / UUID"
-            else
-              echo "✅ Pages 环境变量已验证：URL / PRELOAD_RACE_DIAL / TCP_CONCURRENT_DIAL / PROXY_CONCURRENT_DIAL"
-            fi
+            echo "✅ Pages 环境变量已验证：敏感变量（ADMIN / UUID / KEY）与全部 9 个可选变量的实际存在性/值/明文类型。"
 
-            echo "✅ Pages KV 绑定已验证：KV -> ${kv_id}"
+            echo "✅ Pages KV 绑定已验证。"
 
             # ----------------------------------------------------------
             # 6. 获取最终域名
@@ -999,7 +1453,7 @@ jobs:
           done
 
           # ==========================================================
-          # 同步最新远端 domain.txt
+          # 同步最新远端仓库状态（包含刚刚保存的持久化配置）
           # ==========================================================
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
