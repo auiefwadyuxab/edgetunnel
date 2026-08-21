@@ -619,7 +619,7 @@ jobs:
           echo "📦 上游仓库：${UPSTREAM_REPO}"
           echo "🌿 上游分支：${UPSTREAM_BRANCH}"
           echo "🔗 ZIP：${ZIP_URL}"
-          echo "🔐 ADMIN / UUID / KEY：仅从 GitHub Secrets 读取，不打印值"
+          echo "🔐 ADMIN / UUID / KEY：从 GitHub Secrets 读取；KEY 有值时所有项目都会写入"
           echo "⚙️ 可选变量状态："
           [[ -n "${PRELOAD_RACE_DIAL}" ]] && echo "   PRELOAD_RACE_DIAL=1" || echo "   PRELOAD_RACE_DIAL=默认"
           [[ -n "${TCP_CONCURRENT_DIAL}" ]] && echo "   TCP_CONCURRENT_DIAL=自定义（数值不打印）" || echo "   TCP_CONCURRENT_DIAL=默认"
@@ -636,7 +636,6 @@ jobs:
           else
             echo "⏱️ 运行方式：自动执行（沿用最近一次手动保存）"
           fi
-          echo "🔐 ADMIN / UUID / KEY：仅从 GitHub Secrets 读取，不打印值"
           echo "⚙️ 9 个可选变量：默认状态不写入；其余状态不打印实际值"
           echo "=================================================="
 
@@ -725,13 +724,6 @@ jobs:
           declare -a CREDENTIALS=()
           declare -a AUTH_TYPES=()
           declare -a AUTH_EMAILS=()
-
-          trim() {
-            local value="$1"
-            value="${value#"${value%%[![:space:]]*}"}"
-            value="${value%"${value##*[![:space:]]}"}"
-            printf '%s' "${value}"
-          }
 
           while IFS= read -r raw_line || [[ -n "${raw_line}" ]]; do
             line="$(trim "${raw_line}")"
@@ -917,9 +909,9 @@ jobs:
           # ==========================================================
           # 生成完整 Wrangler 配置
           #
-          # Wrangler vars 对应 Pages 生产环境的明文环境变量；
-          # 按用户要求，ADMIN / UUID / KEY 也写入 vars，而不是 secret_text。
-          # 它们只在 Runner 临时目录生成，绝不写入仓库。
+          # Wrangler vars 对应 Pages 生产环境的明文环境变量。
+          # ADMIN 受 UUID 聚合规则控制；UUID 只在聚合节点写入；KEY 与项目无关，
+          # 只要 Secret 有值，就对每个项目写入。配置文件只存在于 Runner 临时目录。
           # ==========================================================
           write_wrangler_config() {
             local project_name="$1"
@@ -971,11 +963,10 @@ jobs:
 
             jq empty "${config_file}"
 
-            echo "📄 Wrangler 配置已生成：敏感变量只在 Runner 临时文件中使用。"
+            echo "📄 Wrangler 配置已生成。"
             echo "   ADMIN：$([[ "${include_admin}" == "true" ]] && echo "写入" || echo "不写入")"
             echo "   UUID：$([[ -n "${shared_uuid}" ]] && echo "写入" || echo "不写入")"
-            echo "   KEY：$([[ -n "${KEY_PASS}" ]] && echo "写入" || echo "不写入")"
-            echo "   其余 9 个变量按本次持久化选择写入；实际值不打印。"
+            echo "   KEY：$([[ -n "${KEY_PASS}" ]] && echo "写入" || echo "不写入（无 Secret）")"
           }
 
           # ==========================================================
@@ -1059,8 +1050,8 @@ jobs:
           # 验证 Cloudflare Pages API 返回的 production env_vars：
           # - 应写入的变量：存在、类型为 plain_text、值与预期一致；
           # - default 状态的 9 个变量：必须不存在；
-          # - ADMIN / UUID 保持现有聚合逻辑；
-          # - KEY 若 Secret 存在，则所有项目写入。
+          # - ADMIN / UUID 按特殊聚合逻辑处理；
+          # - KEY 与 UUID 无关：有 KEY Secret 时，每个项目都必须存在且一致。
           # ==========================================================
           verify_production_config() {
             local project_json="$1"
@@ -1254,23 +1245,19 @@ jobs:
 
             if [[ "${UUID_VALID}" == true ]]; then
               if [[ "${project_name}" == "${UUID_SOURCE_INDEX}" ]]; then
-                echo "🧩 角色：UUID 提供项目"
-                echo "   ✅ 写入 ADMIN"
-                echo "   ✅ 不写 UUID"
+                echo "🧩 UUID：提供项目 → 写 ADMIN，不写 UUID"
               else
-                echo "🧩 角色：UUID 聚合节点"
-                echo "   ✅ 写入固定 UUID（值不打印）"
-                echo "   ✅ 不写 ADMIN"
+                echo "🧩 UUID：聚合项目 → 写固定 UUID，不写 ADMIN"
               fi
             else
-              echo "🧩 角色：独立项目（未启用 UUID 聚合）"
-              echo "   ✅ 写入 ADMIN"
+              echo "🧩 UUID：未启用聚合 → 写 ADMIN，不写 UUID"
             fi
 
+            # KEY 是全局变量：只要 Secret 有值，所有项目统一写入。
             if [[ -n "${KEY_PASS}" ]]; then
-              echo "   ✅ KEY：写入（Secret 值不打印）"
+              echo "🔑 KEY：所有项目写入"
             else
-              echo "   ℹ️ KEY：未配置"
+              echo "🔑 KEY：未配置"
             fi
 
             # ----------------------------------------------------------
@@ -1409,7 +1396,7 @@ jobs:
               "${include_admin}"
 
             # ----------------------------------------------------------
-            # 4. 部署；仅在 Wrangler 本身失败时重试一次
+            # 4. 部署；失败后最多重试一次，避免无限循环
             # ----------------------------------------------------------
             echo "🌐 正在部署 Pages 项目 ${project_name}..."
 
