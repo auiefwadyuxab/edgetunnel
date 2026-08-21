@@ -6,7 +6,7 @@ on:
       - main
     paths-ignore:
       - domain.txt
-      - .github/workflows/edgetunnel-settings.json
+      - edgetunnel-settings.json
   schedule:
     # 台湾时间每天 08:00
     - cron: "0 8 * * *"
@@ -212,8 +212,8 @@ jobs:
           readonly KV_NAME="kv"
           readonly PAGES_PRODUCTION_BRANCH="main"
           readonly API_BASE="https://api.cloudflare.com/client/v4"
-          readonly SETTINGS_FILE="${GITHUB_WORKSPACE}/.github/workflows/edgetunnel-settings.json"
-          # 持久化文件仅包含 9 个非敏感变量；位置与本 workflow 同目录，便于维护。
+          readonly SETTINGS_FILE="${GITHUB_WORKSPACE}/edgetunnel-settings.json"
+          # 持久化文件仅包含 9 个非敏感变量；位置在 .github 目录下，避免 GitHub 将它误判为工作流文件，同时便于维护。
 
           : "${CF_ACCOUNTS:?❌ 未检测到 CF_ACCOUNTS Secrets 变量}"
           : "${ADMIN_PASS:?❌ 未检测到 ADMIN Secrets 变量}"
@@ -274,10 +274,36 @@ jobs:
             fi
           }
 
-          load_persisted_optional_settings() {
-            if [[ ! -f "${SETTINGS_FILE}" ]]; then
+          SETTINGS_FILE_WAS_CREATED=false
+
+          ensure_settings_file() {
+            local settings_dir
+            settings_dir="$(dirname "${SETTINGS_FILE}")"
+            mkdir -p "${settings_dir}"
+
+            if [[ -f "${SETTINGS_FILE}" ]]; then
               return 0
             fi
+
+            cat > "${SETTINGS_FILE}" <<'EOF'
+          {
+            "preload_race_dial": null,
+            "tcp_concurrent_dial": null,
+            "proxy_concurrent_dial": null,
+            "url": null,
+            "proxyip": null,
+            "go2socks5": null,
+            "debug": null,
+            "off_log": null,
+            "best_sub": null
+          }
+          EOF
+            SETTINGS_FILE_WAS_CREATED=true
+            echo "🆕 未发现持久化配置，已自动生成默认配置文件（9 个变量均不设置）。"
+          }
+
+          load_persisted_optional_settings() {
+            ensure_settings_file
 
             if ! jq -e '
               type == "object"
@@ -508,6 +534,44 @@ jobs:
             echo "✅ 本次手动选择已持久化；后续自动部署将沿用这 9 个变量的状态。"
           }
 
+          persist_created_default_settings() {
+            if [[ "${SETTINGS_FILE_WAS_CREATED}" != "true" ]]; then
+              return 0
+            fi
+
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+            git fetch origin "${GITHUB_REF_NAME}" --quiet
+            git reset --hard "origin/${GITHUB_REF_NAME}"
+
+            mkdir -p "$(dirname "${SETTINGS_FILE}")"
+            cat > "${SETTINGS_FILE}" <<'EOF'
+          {
+            "preload_race_dial": null,
+            "tcp_concurrent_dial": null,
+            "proxy_concurrent_dial": null,
+            "url": null,
+            "proxyip": null,
+            "go2socks5": null,
+            "debug": null,
+            "off_log": null,
+            "best_sub": null
+          }
+          EOF
+
+            if [[ -z "$(git status --porcelain=v1 -- "${SETTINGS_FILE}")" ]]; then
+              SETTINGS_FILE_WAS_CREATED=false
+              return 0
+            fi
+
+            git add "${SETTINGS_FILE}"
+            git commit -m "chore: initialize EdgeTunnel deploy settings [skip ci]"
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+            SETTINGS_FILE_WAS_CREATED=false
+            echo "✅ 默认持久化配置已自动保存到 GitHub。"
+          }
+
           load_or_resolve_optional_settings() {
             if [[ "${IS_MANUAL}" == "true" ]]; then
               resolve_manual_optional_settings
@@ -516,6 +580,7 @@ jobs:
             else
               load_persisted_optional_settings
               validate_optional_settings
+              persist_created_default_settings
             fi
           }
 
