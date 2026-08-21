@@ -1,8 +1,8 @@
 {
-  "preload_race_dial": null,
+  "preload_race_dial": "1",
   "tcp_concurrent_dial": null,
   "proxy_concurrent_dial": null,
-  "url": null,
+  "url": "https://cloudflare-error-page-3th.pages.dev",
   "proxyip": null,
   "go2socks5": null,
   "debug": null,
