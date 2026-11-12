@@ -1,18 +1,9 @@
 name: 批量自动部署至 Cloudflare Pages
 
 on:
-  push:
-    branches:
-      - main
-    paths-ignore:
-      - domain.txt
-      - edgetunnel-settings.json
   schedule:
-    # 台湾时间每天 08:00
-    - cron: "0 8 * * *"
-      timezone: "Asia/Taipei"
-    # 台湾时间每天 19:00
-    - cron: "0 19 * * *"
+    # 每 6 小时检查一次上游；避开整点高峰。
+    - cron: "17 */6 * * *"
       timezone: "Asia/Taipei"
   workflow_dispatch:
     inputs:
@@ -133,14 +124,131 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Detect EdgeTunnel upstream changes
+        id: upstream
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          CF_ACCOUNTS: ${{ secrets.CF_ACCOUNTS }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          readonly REPO="cmliu/edgetunnel"
+          readonly BRANCH="alpha2.1"
+          readonly STATE_FILE="${GITHUB_WORKSPACE}/edgetunnel-upstream-state.json"
+          readonly API="https://api.github.com/repos/${REPO}"
+          headers=(
+            -H "Accept: application/vnd.github+json"
+            -H "Authorization: Bearer ${GITHUB_TOKEN}"
+            -H "X-GitHub-Api-Version: 2022-11-28"
+            -H "User-Agent: edgetunnel-upstream-check"
+          )
+
+          # 检测接口失败必须终止，绝不把“未知”误判成“没有更新”。
+          commit_json="$(curl -fsSL --retry 4 --retry-all-errors --retry-delay 2 "${headers[@]}" "${API}/commits/${BRANCH}")"
+          upstream_sha="$(jq -er '.sha | select(test("^[0-9a-f]{40}$"))' <<< "${commit_json}")"
+
+          changelog_json="$(curl -fsSL --retry 4 --retry-all-errors --retry-delay 2 "${headers[@]}" "${API}/contents/CHANGELOG?ref=${upstream_sha}")"
+          worker_json="$(curl -fsSL --retry 4 --retry-all-errors --retry-delay 2 "${headers[@]}" "${API}/contents/_worker.js?ref=${upstream_sha}")"
+          readme_json="$(curl -fsSL --retry 4 --retry-all-errors --retry-delay 2 "${headers[@]}" "${API}/contents/README.md?ref=${upstream_sha}")"
+
+          changelog_sha="$(jq -er '.sha | select(test("^[0-9a-f]{40}$"))' <<< "${changelog_json}")"
+          worker_sha="$(jq -er '.sha | select(test("^[0-9a-f]{40}$"))' <<< "${worker_json}")"
+          readme_sha="$(jq -er '.sha | select(test("^[0-9a-f]{40}$"))' <<< "${readme_json}")"
+          readme_body="$(jq -r '.content' <<< "${readme_json}" | base64 -d)"
+          readme_vars_section="$(awk '
+            /^## 🔑 环境变量说明/ {capture=1}
+            capture && /^## / && !/^## 🔑 环境变量说明/ {exit}
+            capture {print}
+          ' <<< "${readme_body}")"
+          if [[ -z "${readme_vars_section}" ]]; then
+            echo "::error::README 环境变量说明区无法识别，停止自动部署以避免遗漏变量变更。"
+            exit 1
+          fi
+          readme_vars_sha="$(printf '%s' "${readme_vars_section}" | sha256sum | awk '{print $1}')"
+
+          # 统计当前配置的目标账号数；不把凭据写入日志或状态文件。
+          mapfile -t configured_account_ids < <(
+            awk 'NF && $0 !~ /^[[:space:]]*#/ {split($0, fields, ":"); print fields[1]}' <<< "${CF_ACCOUNTS:-}"
+          )
+          account_count="${#configured_account_ids[@]}"
+          if (( account_count < 1 )); then
+            echo "::error::CF_ACCOUNTS 为空，无法确定需要追踪的 Pages 项目数量。"
+            exit 1
+          fi
+
+          readme_vars_changed=false
+          if [[ -s "${STATE_FILE}" ]] && jq -e '.projects | type == "object" and length > 0' "${STATE_FILE}" >/dev/null 2>&1; then
+            if jq -e --arg sha "${readme_vars_sha}" \
+              '[.projects[]?.readme_vars_sha // empty] | any(. != $sha)' \
+              "${STATE_FILE}" >/dev/null 2>&1; then
+              readme_vars_changed=true
+            fi
+          fi
+
+          should_deploy=false
+          reason="all_projects_at_current_upstream"
+          if [[ "${EVENT_NAME}" == "workflow_dispatch" ]]; then
+            should_deploy=true
+            reason="manual_force"
+          else
+            if [[ ! -s "${STATE_FILE}" ]] || ! jq -e 'type == "object" and (.projects | type == "object")' "${STATE_FILE}" >/dev/null 2>&1; then
+              should_deploy=true
+              reason="state_missing_or_invalid"
+            else
+              for ((i=1; i<=account_count; i++)); do
+                deployed_commit="$(jq -r --arg key "${i}" '.projects[$key].commit_sha // ""' "${STATE_FILE}")"
+                deployed_changelog="$(jq -r --arg key "${i}" '.projects[$key].changelog_sha // ""' "${STATE_FILE}")"
+                deployed_worker="$(jq -r --arg key "${i}" '.projects[$key].worker_sha // ""' "${STATE_FILE}")"
+                deployed_account_hash="$(jq -r --arg key "${i}" '.projects[$key].account_id_hash // ""' "${STATE_FILE}")"
+                current_account_hash="$(printf '%s' "${configured_account_ids[$((i - 1))]}" | sha256sum | awk '{print $1}')"
+                if [[ "${deployed_commit}" != "${upstream_sha}" || \
+                      "${deployed_changelog}" != "${changelog_sha}" || \
+                      "${deployed_worker}" != "${worker_sha}" || \
+                      "${deployed_account_hash}" != "${current_account_hash}" ]]; then
+                  should_deploy=true
+                  reason="project_${i}_needs_update"
+                  break
+                fi
+              done
+            fi
+          fi
+
+          {
+            echo "commit_sha=${upstream_sha}"
+            echo "changelog_sha=${changelog_sha}"
+            echo "worker_sha=${worker_sha}"
+            echo "readme_sha=${readme_sha}"
+            echo "readme_vars_sha=${readme_vars_sha}"
+            echo "readme_vars_changed=${readme_vars_changed}"
+            echo "should_deploy=${should_deploy}"
+            echo "reason=${reason}"
+          } >> "${GITHUB_OUTPUT}"
+
+          echo "上游分支：${BRANCH}"
+          echo "Commit：${upstream_sha}"
+          echo "CHANGELOG SHA：${changelog_sha}"
+          echo "_worker.js SHA：${worker_sha}"
+          echo "README SHA：${readme_sha}"
+          echo "README 环境变量区 SHA：${readme_vars_sha}"
+          echo "触发原因：${reason}"
+          if [[ "${readme_vars_changed}" == "true" ]]; then
+            echo "::warning::上游 README 环境变量说明区发生变化；请核对九项变量映射是否需要同步。Worker 新功能仍按上游默认行为部署，不会因为本次变化而主动关闭。"
+          fi
+          if [[ "${should_deploy}" != "true" ]]; then
+            echo "✅ 所有目标项目均已部署当前上游版本，本轮结束。"
+          fi
+
       - name: Setup Node.js
+        if: steps.upstream.outputs.should_deploy == 'true'
         uses: actions/setup-node@v7
         with:
           node-version: "24.x"
           check-latest: true
           package-manager-cache: false
 
-      - name: Install Latest Wrangler
+      - name: Install Latest Wrangler (fallback to last verified version)
+        if: steps.upstream.outputs.should_deploy == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -148,15 +256,26 @@ jobs:
           WRANGLER_HOME="${RUNNER_TEMP}/wrangler"
           mkdir -p "${WRANGLER_HOME}"
 
-          npm install \
+          if npm install \
             --prefix "${WRANGLER_HOME}" \
             --no-save \
             --no-package-lock \
-            wrangler@latest
+            wrangler@latest; then
+            echo "✅ 已安装 Wrangler latest。"
+          else
+            echo "⚠️ Wrangler latest 安装失败，回退到最近验证版本 4.161.0。"
+            rm -rf "${WRANGLER_HOME}/node_modules"
+            npm install \
+              --prefix "${WRANGLER_HOME}" \
+              --no-save \
+              --no-package-lock \
+              wrangler@4.161.0
+          fi
 
           "${WRANGLER_HOME}/node_modules/.bin/wrangler" --version
 
       - name: Download EdgeTunnel and Batch Deploy
+        if: steps.upstream.outputs.should_deploy == 'true'
         shell: bash
         env:
           CF_ACCOUNTS: ${{ secrets.CF_ACCOUNTS }}
@@ -164,6 +283,12 @@ jobs:
           UUID_CONFIG: ${{ secrets.UUID }}
           KEY_PASS: ${{ secrets.KEY }}
           GITHUB_TOKEN: ${{ github.token }}
+          UPSTREAM_SHA: ${{ steps.upstream.outputs.commit_sha }}
+          UPSTREAM_CHANGELOG_SHA: ${{ steps.upstream.outputs.changelog_sha }}
+          UPSTREAM_WORKER_SHA: ${{ steps.upstream.outputs.worker_sha }}
+          UPSTREAM_README_SHA: ${{ steps.upstream.outputs.readme_sha }}
+          UPSTREAM_README_VARS_SHA: ${{ steps.upstream.outputs.readme_vars_sha }}
+          IS_SCHEDULE: ${{ github.event_name == 'schedule' }}
           WRANGLER_BIN: ${{ runner.temp }}/wrangler/node_modules/.bin/wrangler
           IS_MANUAL: ${{ github.event_name == 'workflow_dispatch' }}
           INPUT_PRELOAD_RACE_DIAL: ${{ inputs.preload_race_dial }}
@@ -202,7 +327,7 @@ jobs:
           # 持久化配置只保存这 9 个非敏感变量，绝不保存 ADMIN / UUID / KEY。
           # ==========================================================
           readonly UPSTREAM_REPO="cmliu/edgetunnel"
-          readonly UPSTREAM_BRANCH="beta2.1"
+          readonly UPSTREAM_BRANCH="alpha2.1"
 
           # README 中给出的示例值；只有选择 custom 时才会作为输入框预填充。
           readonly URL_EXAMPLE="https://cloudflare-error-page-3th.pages.dev"
@@ -213,7 +338,8 @@ jobs:
           readonly PAGES_PRODUCTION_BRANCH="main"
           readonly API_BASE="https://api.cloudflare.com/client/v4"
           readonly SETTINGS_FILE="${GITHUB_WORKSPACE}/edgetunnel-settings.json"
-          # 持久化文件仅包含 9 个非敏感变量；位置在 .github 目录下，避免 GitHub 将它误判为工作流文件，同时便于维护。
+          readonly UPSTREAM_STATE_FILE="${GITHUB_WORKSPACE}/edgetunnel-upstream-state.json"
+          readonly COMPATIBILITY_DATE="2026-11-11"
 
           : "${CF_ACCOUNTS:?❌ 未检测到 CF_ACCOUNTS Secrets 变量}"
           : "${ADMIN_PASS:?❌ 未检测到 ADMIN Secrets 变量}"
@@ -611,14 +737,18 @@ jobs:
 
           load_or_resolve_optional_settings
 
-          readonly ZIP_URL="https://github.com/${UPSTREAM_REPO}/archive/refs/heads/${UPSTREAM_BRANCH}.zip"
+          readonly ZIP_URL="https://github.com/${UPSTREAM_REPO}/archive/${UPSTREAM_SHA}.zip"
 
           echo "=================================================="
           echo "🚀 EdgeTunnel 批量自动部署"
           echo "=================================================="
           echo "📦 上游仓库：${UPSTREAM_REPO}"
           echo "🌿 上游分支：${UPSTREAM_BRANCH}"
-          echo "🔗 ZIP：${ZIP_URL}"
+          echo "🔗 固定版本源码包：${ZIP_URL}"
+          echo "🔖 Commit：${UPSTREAM_SHA}"
+          echo "📄 CHANGELOG SHA：${UPSTREAM_CHANGELOG_SHA}"
+          echo "📄 _worker.js SHA：${UPSTREAM_WORKER_SHA}"
+          echo "🗓️ Compatibility Date：${COMPATIBILITY_DATE}"
           echo "🔐 ADMIN / UUID / KEY：从 GitHub Secrets 读取；KEY 有值时所有项目都会写入"
           echo "⚙️ 可选变量状态："
           [[ -n "${PRELOAD_RACE_DIAL}" ]] && echo "   PRELOAD_RACE_DIAL=1" || echo "   PRELOAD_RACE_DIAL=默认"
@@ -679,9 +809,19 @@ jobs:
             exit 1
           fi
 
-          if [[ ! -f "${PAYLOAD_DIR}/_worker.js" ]]; then
-            echo "❌ ${UPSTREAM_BRANCH} 中没有找到 _worker.js。"
+          if [[ ! -f "${PAYLOAD_DIR}/_worker.js" || ! -f "${PAYLOAD_DIR}/CHANGELOG" || ! -f "${PAYLOAD_DIR}/README.md" ]]; then
+            echo "❌ 上游源码缺少 _worker.js、CHANGELOG 或 README.md 必需文件。"
             echo "❌ 为防止部署错误版本，本次任务终止。"
+            exit 1
+          fi
+
+          actual_worker_blob_sha="$(git hash-object "${PAYLOAD_DIR}/_worker.js")"
+          actual_changelog_blob_sha="$(git hash-object "${PAYLOAD_DIR}/CHANGELOG")"
+          if [[ "${actual_worker_blob_sha}" != "${UPSTREAM_WORKER_SHA}" || \
+                "${actual_changelog_blob_sha}" != "${UPSTREAM_CHANGELOG_SHA}" ]]; then
+            echo "❌ 下载源码的文件 SHA 与 GitHub API 元数据不一致，拒绝部署。"
+            echo "   _worker.js：预期 ${UPSTREAM_WORKER_SHA} / 实际 ${actual_worker_blob_sha}"
+            echo "   CHANGELOG：预期 ${UPSTREAM_CHANGELOG_SHA} / 实际 ${actual_changelog_blob_sha}"
             exit 1
           fi
 
@@ -692,26 +832,12 @@ jobs:
             "${PAYLOAD_DIR}/wrangler.jsonc"
 
           SOURCE_SHA="$(sha256sum "${SOURCE_ZIP}" | awk '{print $1}')"
-          readonly COMPATIBILITY_DATE="$(date -u -d '1 day ago' +%Y-%m-%d)"
-
-          echo "🗓️ Compatibility Date：${COMPATIBILITY_DATE}"
-          echo "🔐 ZIP SHA256：${SOURCE_SHA}"
-
-          if UPSTREAM_SHA="$(
-            curl -fsSL \
-              --retry 3 \
-              --retry-all-errors \
-              -H "Accept: application/vnd.github+json" \
-              -H "X-GitHub-Api-Version: 2026-03-10" \
-              -H "Authorization: Bearer ${GITHUB_TOKEN}" \
-              -H "User-Agent: github-actions-edgetunnel-deployer" \
-              "https://api.github.com/repos/${UPSTREAM_REPO}/commits/${UPSTREAM_BRANCH}" |
-            jq -r '.sha // empty'
-          )"; then
-            echo "🔖 ${UPSTREAM_BRANCH} 当前提交：${UPSTREAM_SHA}"
-          else
-            echo "⚠️ 无法获取 GitHub 当前 commit SHA，继续部署。"
+          if [[ -z "${UPSTREAM_SHA}" || -z "${UPSTREAM_CHANGELOG_SHA}" || -z "${UPSTREAM_WORKER_SHA}" ]]; then
+            echo "❌ 上游版本元数据不完整，拒绝部署。"
+            exit 1
           fi
+          echo "🔐 ZIP SHA256：${SOURCE_SHA}"
+          echo "🔖 固定部署 Commit：${UPSTREAM_SHA}"
 
           # ==========================================================
           # 解析 CF_ACCOUNTS
@@ -986,6 +1112,8 @@ jobs:
                 "${WRANGLER_BIN}" pages deploy . \
                   --project-name="${project_name}" \
                   --branch="${PAGES_PRODUCTION_BRANCH}" \
+                  --commit-hash="${UPSTREAM_SHA}" \
+                  --commit-message="EdgeTunnel upstream ${UPSTREAM_SHA}" \
                   --commit-dirty=true
             else
               env \
@@ -996,6 +1124,8 @@ jobs:
                 "${WRANGLER_BIN}" pages deploy . \
                   --project-name="${project_name}" \
                   --branch="${PAGES_PRODUCTION_BRANCH}" \
+                  --commit-hash="${UPSTREAM_SHA}" \
+                  --commit-message="EdgeTunnel upstream ${UPSTREAM_SHA}" \
                   --commit-dirty=true
             fi
           }
@@ -1198,6 +1328,7 @@ jobs:
           declare -a ADMIN_DOMAINS=()
           declare -a HOST_DOMAINS=()
           declare -a FAILED_PROJECTS=()
+          declare -a SUCCEEDED_PROJECTS=()
 
           DEPLOYED_COUNT=0
 
@@ -1499,8 +1630,32 @@ jobs:
           # 逐账号部署
           # ==========================================================
           for ((i=0; i<ACCOUNT_COUNT; i++)); do
-            if ! deploy_one "${i}"; then
-              FAILED_PROJECTS+=("$((i + 1))")
+            project_number="$((i + 1))"
+            already_current=false
+            if [[ "${IS_SCHEDULE}" == "true" && -s "${UPSTREAM_STATE_FILE}" ]] &&
+              jq -e \
+                --arg key "${project_number}" \
+                --arg commit "${UPSTREAM_SHA}" \
+                --arg changelog "${UPSTREAM_CHANGELOG_SHA}" \
+                --arg worker "${UPSTREAM_WORKER_SHA}" \
+                --arg account_hash "$(printf '%s' "${ACCOUNT_IDS[$i]}" | sha256sum | awk '{print $1}')" \
+                '.projects[$key].commit_sha == $commit
+                 and .projects[$key].changelog_sha == $changelog
+                 and .projects[$key].worker_sha == $worker
+                 and .projects[$key].account_id_hash == $account_hash' \
+                "${UPSTREAM_STATE_FILE}" >/dev/null 2>&1; then
+              already_current=true
+            fi
+
+            if [[ "${already_current}" == "true" ]]; then
+              echo "⏭️ 项目 ${project_number} 已部署当前上游版本，跳过。"
+              continue
+            fi
+
+            if deploy_one "${i}"; then
+              SUCCEEDED_PROJECTS+=("${project_number}")
+            else
+              FAILED_PROJECTS+=("${project_number}")
             fi
           done
 
@@ -1512,6 +1667,46 @@ jobs:
 
           git fetch origin "${GITHUB_REF_NAME}" --quiet
           git reset --hard "origin/${GITHUB_REF_NAME}"
+
+          # ==========================================================
+          # 按项目保存成功版本：部分失败时，下轮只重试尚未成功的项目。
+          # 手动强制部署仍会逐个执行全部项目。
+          # ==========================================================
+          if [[ ! -s "${UPSTREAM_STATE_FILE}" ]] || ! jq -e 'type == "object" and (.projects | type == "object")' "${UPSTREAM_STATE_FILE}" >/dev/null 2>&1; then
+            printf '{"schema_version":1,"projects":{}}\n' > "${UPSTREAM_STATE_FILE}"
+          fi
+
+          for project_number in "${SUCCEEDED_PROJECTS[@]}"; do
+            tmp_state="${UPSTREAM_STATE_FILE}.tmp"
+            jq \
+              --arg key "${project_number}" \
+              --arg commit "${UPSTREAM_SHA}" \
+              --arg changelog "${UPSTREAM_CHANGELOG_SHA}" \
+              --arg worker "${UPSTREAM_WORKER_SHA}" \
+              --arg readme "${UPSTREAM_README_SHA}" \
+              --arg readme_vars "${UPSTREAM_README_VARS_SHA}" \
+              --arg account_hash "$(printf '%s' "${ACCOUNT_IDS[$((project_number - 1))]}" | sha256sum | awk '{print $1}')" \
+              --arg deployed_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+              '.projects[$key] = {
+                account_id_hash: $account_hash,
+                commit_sha: $commit,
+                changelog_sha: $changelog,
+                worker_sha: $worker,
+                readme_sha: $readme,
+                readme_vars_sha: $readme_vars,
+                deployed_at: $deployed_at
+              }' "${UPSTREAM_STATE_FILE}" > "${tmp_state}"
+            mv "${tmp_state}" "${UPSTREAM_STATE_FILE}"
+          done
+
+          if (( ${#SUCCEEDED_PROJECTS[@]} > 0 )); then
+            git add "${UPSTREAM_STATE_FILE}"
+            if ! git diff --cached --quiet; then
+              git commit -m "chore: record EdgeTunnel per-project upstream deployment state [skip ci]"
+              git push origin "HEAD:${GITHUB_REF_NAME}"
+              echo "✅ 已保存成功项目的上游版本状态：${SUCCEEDED_PROJECTS[*]}"
+            fi
+          fi
 
           # ==========================================================
           # 读取旧 domain.txt
